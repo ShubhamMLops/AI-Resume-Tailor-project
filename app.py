@@ -1,142 +1,158 @@
-import os
-import time
-import pandas as pd
-import plotly.graph_objects as go
+import io, os, json
 import streamlit as st
+from pipeline import analyze, tailor, extract_keywords_llm, extract_contacts_llm, sanitize_markdown
+from utils import export_docx, export_pdf
 
-from analysis import perform_full_analysis, call_llm_text, generate_ats_preview
-from config import APP_VERSION
-from utils import (
-    clean_linkedin_jd, get_history, init_db, log_analysis,
-    format_docx_stable, format_pdf_stable, read_file_to_text
-)
+st.set_page_config(page_title="API-only Resume Tailor (v8 final)", page_icon="🧰", layout="wide")
+st.title("🧰 API-only Resume Tailor (v8 final)")
+st.caption("v8 layout • Full content read • Colored headings in DOCX/PDF • Plain-text output (no ##/**)")
 
-# --- App Setup ---
-st.set_page_config(page_title="AI Resume Suite", page_icon="🚀", layout="wide")
-init_db()
-st.title(f"🚀 Ultimate AI Resume Suite (v{APP_VERSION})")
-
-# --- Session State ---
-for key, default in [("analysis_run", False), ("analysis_data", {}), ("jd_input", "")]:
-    if key not in st.session_state: st.session_state[key] = default
-
-# --- Helper Functions ---
-def create_radar_chart(data: dict):
-    categories = ['Match Score', 'ATS Score', 'STAR Score', 'Readability']
-    readability_map = {'Good': 100, 'Simple': 75, 'Complex': 50, 'N/A': 0, "Error": 0}
-    scores = [data.get('score', 0), data.get('ats', {}).get('score', 0), data.get('star_score', 0), readability_map.get(data.get('readability', {}).get('rating'), 0)]
-    fig = go.Figure(data=go.Scatterpolar(r=scores, theta=categories, fill='toself', line=dict(color='#6272a4')))
-    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100]), bgcolor="#282a36"), showlegend=False, paper_bgcolor="#0E1117", font_color="#FAFAFA")
-    return fig
-
-# --- Sidebar ---
 with st.sidebar:
-    st.header("Configuration")
-    with st.expander("⚙️ AI & API Settings", expanded=True):
-        primary_backend = st.selectbox("Primary AI Backend", ["Google Gemini", "OpenAI GPT", "Anthropic Claude", "Ollama (local)"])
-        keys = {"gemini": st.text_input("Gemini API Key", type="password"), "openai": st.text_input("OpenAI API Key", type="password"), "anthropic": st.text_input("Anthropic API Key", type="password")}
-    st.header("📚 Analysis History")
-    for r in get_history(): st.caption(f"{r['timestamp'][:16]} · Score {r['match_score']} · {r['resume_name']}")
+    st.header("🔑 Provider & Model")
+    provider = st.selectbox("Provider", ["openai","gemini","anthropic"], index=1)
+    model = st.text_input("Model name (optional)", value="")
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+    max_tokens = st.slider("Max tokens", 256, 4096, 1500, 64)
 
-# --- Main Interface ---
-c1, c2 = st.columns(2)
-with c1: resumes = st.file_uploader("1. Upload Your Resume(s)", type=["txt", "docx", "pdf"], accept_multiple_files=True)
-with c2:
-    st.text_area("2. Paste the Job Description", height=245, key="jd_input")
-    if st.button("🧹 Clean JD", use_container_width=True) and st.session_state.jd_input:
-        st.session_state.jd_input = clean_linkedin_jd(st.session_state.jd_input)
+    st.header("🔐 API Keys")
+    openai_key = st.text_input("OpenAI API Key", type="password")
+    gemini_key = st.text_input("Gemini API Key", type="password")
+    anthropic_key = st.text_input("Anthropic API Key", type="password")
+    keys = {"openai": openai_key.strip(), "gemini": gemini_key.strip(), "anthropic": anthropic_key.strip()}
 
-# --- Main Workflow ---
-if st.button("✨ Analyze & Tailor Resumes", type="primary", use_container_width=True):
-    if not (resumes and st.session_state.jd_input): st.warning("Please upload a resume and paste a job description.")
-    else:
-        st.session_state.analysis_data, st.session_state.resumes_list = {}, resumes
-        for rf in resumes:
-            text = read_file_to_text(rf)
-            if text: st.session_state.analysis_data[rf.name] = perform_full_analysis(text, st.session_state.jd_input, primary_backend, keys)
-        if st.session_state.analysis_data: st.session_state.analysis_run = True; st.rerun()
-        else: st.error("Could not process any uploaded resumes.")
+def read_textarea_or_file(label: str, key_text: str, key_file: str) -> str:
+    txt = st.session_state.get(key_text, "")
+    up = st.file_uploader(label, type=["txt","md","pdf","docx"], key=key_file)
+    if up is not None:
+        ext = up.name.lower().split(".")[-1]
+        if ext in ("txt","md"):
+            txt = up.read().decode("utf-8", errors="ignore")
+        elif ext == "pdf":
+            try:
+                from pdfminer.high_level import extract_text
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(up.read()); tmp.flush()
+                    txt = extract_text(tmp.name) or ""
+            except Exception:
+                from PyPDF2 import PdfReader
+                up.seek(0); reader = PdfReader(up)
+                txt = "\n".join(page.extract_text() or "" for page in reader.pages)
+        elif ext == "docx":
+            from docx import Document
+            d = Document(up)
+            paras = [p.text for p in d.paragraphs]
+            # include docx table text
+            for tbl in d.tables:
+                for row in tbl.rows:
+                    paras.append(" | ".join(cell.text for cell in row.cells))
+            txt = "\n".join(paras)
+    txt = st.text_area(f"Or paste {label.lower()} text here", value=txt, height=240, key=key_text)
+    return txt
 
-# --- Results Dashboard ---
-if st.session_state.analysis_run and st.session_state.analysis_data:
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Resume")
+    resume_text = read_textarea_or_file("Resume", "resume_text", "resume_file")
+with col2:
+    st.subheader("Job Description")
+    jd_text = read_textarea_or_file("Job Description", "jd_text", "jd_file")
+
+if resume_text.strip() and jd_text.strip():
+    st.divider()
+    st.subheader("Analysis")
+
+    report = analyze(resume_text, jd_text)
+
+    # Contacts (regex + optional AI + manual)
+    if st.button("Enhance contacts with AI"):
+        try:
+            st.session_state["ai_contacts"] = extract_contacts_llm(resume_text, provider_pref=provider, model_name=(model or None), keys=keys)
+            st.success("Contacts enhanced.")
+        except Exception as e:
+            st.error(str(e))
+
+    ai_contacts = st.session_state.get("ai_contacts", {})
+    merged = {**report["contacts"], **{k: v for k,v in ai_contacts.items() if v}}
+
+    st.markdown("**Contacts**")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: merged["name"] = st.text_input("Name", merged.get("name",""))
+    with c2: merged["email"] = st.text_input("Email", merged.get("email",""))
+    with c3: merged["phone"] = st.text_input("Phone", merged.get("phone",""))
+    with c4: merged["linkedin"] = st.text_input("LinkedIn", merged.get("linkedin",""))
+    with c5: merged["github"] = st.text_input("GitHub", merged.get("github",""))
+    st.session_state["override_contacts"] = merged
+
+    cA, cB, cC = st.columns([1,1,2])
+    with cA:
+        st.metric("Match Score", f"{report['match']['match_score']}%")
+    with cB:
+        st.metric("Readability (FRE)", report["readability"]["flesch_reading_ease"])
+    with cC:
+        st.write("ATS warnings:")
+        for w in report["ats"]["warnings"]:
+            st.write(f"• {w}")
+
     st.markdown("---")
-    st.subheader("Results Dashboard")
-    
-    sorted_resumes = sorted(st.session_state.analysis_data.items(), key=lambda item: item[1]["basic"]["score"], reverse=True)
-    selected_name_full = st.selectbox("Select a resume:", [name for name, data in sorted_resumes])
-    data = st.session_state.analysis_data[selected_name_full]
-    
-    # FIXED: Remove original extension from filename to prevent .pdf.pdf
-    selected_name_base = os.path.splitext(selected_name_full)[0]
+    st.subheader("AI Keywords (optional)")
+    if st.button("Extract AI keywords now"):
+        try:
+            ai_kw = extract_keywords_llm(resume_text, jd_text, provider_pref=provider, model_name=(model or None), temperature=temperature, max_tokens=min(max_tokens, 1200), keys=keys)
+            st.session_state["kw_llm"] = ai_kw
+            st.success("Keywords extracted.")
+        except Exception as e:
+            st.error(str(e))
 
-    original_text = ""
-    for r_file in st.session_state.resumes_list:
-        if r_file.name == selected_name_full: original_text = read_file_to_text(r_file); break
+    kw_obj = st.session_state.get("kw_llm")
+    if kw_obj and kw_obj.get("keywords"):
+        st.write(kw_obj.get("summary",""))
+        for item in kw_obj["keywords"][:15]:
+            st.write(f"{item.get('rank')}. {item.get('term')}")
 
-    tabs = st.tabs(["📊 Insights", "🚀 Performance", "📄 ATS Preview", "✍️ Tailored Resume", "✉️ Cover Letter", "🎙️ Interview Prep", "💾 Export"])
-    
-    with tabs[0]: # Insights
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.metric("Overall Match", f"{data['basic']['score']}%")
-            st.metric("ATS Friendliness", f"{data['basic']['ats']['score']}/100")
-            st.metric("Readability", data['basic']['readability'].get('rating', 'N/A'))
-            st.metric("Action Verbs", data['basic']['action_verbs'])
-        with c2: st.plotly_chart(create_radar_chart(data['basic']), use_container_width=True)
-        present = [k for k, v in data["keywords"].items() if v]
-        missing = [k for k, v in data["keywords"].items() if not v]
-        st.success(f"**Present Keywords ({len(present)}):** {', '.join(present) if present else 'None'}")
-        st.warning(f"**Missing Keywords ({len(missing)}):** {', '.join(missing) if missing else 'None'}")
+    st.divider()
+    st.subheader("Tailor with LLM (API-only)")
+    st.caption("Enhanced v8: reliable header, clean sections, colored headings in exports.")
 
-    with tabs[1]: # Performance
-        st.progress(value=data['performance']['star_analysis'].get('score', 0), text=f"**STAR Method Score: {data['performance']['star_analysis'].get('score', 0)}/100**")
-        with st.expander("**AI Feedback on STAR Method**"):
-            st.markdown(f"**Summary:** {data['performance']['star_analysis'].get('summary', 'N/A')}")
-            st.markdown(f"**Feedback:** {data['performance']['star_analysis'].get('feedback', 'N/A')}")
-        st.markdown(f"**Sentiment:** **{data['performance']['sentiment'].get('label', 'N/A')}** (Score: {data['performance']['sentiment'].get('score', 0.0):.2f})")
-        if data['performance'].get("cliches"): st.info("⚠️ **Clichés Detected:** " + ", ".join(data['performance']["cliches"]))
-    
-    with tabs[2]: # ATS Preview
-        st.subheader("📄 Applicant Tracking System (ATS) Preview")
-        preview_html = generate_ats_preview(original_text, data.get("keywords_list", []))
-        st.markdown(preview_html, unsafe_allow_html=True)
+    auto_weave = st.checkbox("Use AI keywords automatically", value=True)
+    custom_keywords = st.text_input("Optional: comma-separated custom keywords")
 
-    # --- Generative Tabs ---
-    for key_suffix, tab, title, prompt_template in [
-        ("resume", tabs[3], "✍️ AI-Tailored Resume", "You are an expert resume writer. Perform a surgical, additive-only enhancement of the resume based on the job description. ONLY add missing keywords naturally. Do NOT remove content. Output ONLY the complete, plain-text resume.\n\nJD:\n{jd}\n\nRESUME:\n{resume}"),
-        ("cover_letter", tabs[4], "✉️ AI-Generated Cover Letter", "You are a career coach. Write a compelling 3-4 paragraph cover letter connecting the resume strengths to the job's main requirements. Output ONLY the final cover letter text.\n\nJD:\n{jd}\n\nRESUME:\n{resume}"),
-        ("interview_prep", tabs[5], "🎙️ AI-Generated Interview Prep", "You are an expert interview coach. Create a concise interview prep guide with: Top 3 technical questions, Top 3 behavioral questions, Key talking points for the candidate, and 2 questions for the interviewer. Use markdown.\n\nJD:\n{jd}\n\nRESUME:\n{resume}")
-    ]:
-        key = f"{key_suffix}_{selected_name_full}"
-        with tab:
-            st.subheader(title)
-            if key not in st.session_state:
-                if st.button(f"Generate {title.split(' ')[-1]}", key=f"btn_{key}", use_container_width=True):
-                    with st.spinner("Generating..."):
-                        prompt = prompt_template.format(jd=st.session_state.jd_input, resume=original_text)
-                        st.session_state[key] = call_llm_text(prompt, primary_backend, keys)
-                        st.rerun()
-            if key in st.session_state:
-                st.text_area("Edit the result:", value=st.session_state[key], height=400, key=f"editor_{key}")
+    if st.button("Generate tailored resume", type="primary"):
+        try:
+            target = []
+            if auto_weave and kw_obj and kw_obj.get("keywords"):
+                for item in kw_obj["keywords"][:15]:
+                    term = (item.get("term") or "").strip()
+                    if term and term.lower() not in [t.lower() for t in target]:
+                        target.append(term)
+            if custom_keywords.strip():
+                for t in custom_keywords.split(","):
+                    term = t.strip()
+                    if term and term.lower() not in [x.lower() for x in target]:
+                        target.append(term)
 
-    with tabs[6]: # Export
-        st.subheader("💾 Download & Save Center")
-        resume_text_export = st.session_state.get(f"resume_{selected_name_full}", original_text)
-        cover_letter_export = st.session_state.get(f"cover_letter_{selected_name_full}", "")
-        
-        if st.button("💾 Log Analysis to History", use_container_width=True):
-            log_analysis(job_title="N/A", resume_name=selected_name_full, match_score=data['basic']['score'], ats_score=data['basic']['ats']['score'], tailored_resume_text=resume_text_export, cover_letter_text=cover_letter_export)
-            st.toast("Analysis logged!")
+            override_contacts = st.session_state.get("override_contacts")
+            tailored = tailor(resume_text, jd_text, provider_preference=provider, model_name=(model or None),
+                              temperature=temperature, max_tokens=max_tokens, keys=keys,
+                              target_keywords=target, override_contacts=override_contacts)
+            st.session_state["tailored_text"] = sanitize_markdown(tailored)
+            st.success("Tailored resume generated.")
+        except Exception as e:
+            st.error(str(e))
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("#### Tailored Resume")
-            st.download_button("📄 Download DOCX", data=format_docx_stable(resume_text_export, primary_backend, keys), file_name=f"Resume_{selected_name_base}.docx", use_container_width=True, disabled=not resume_text_export)
-            st.download_button("📑 Download PDF", data=format_pdf_stable(resume_text_export, primary_backend, keys), file_name=f"Resume_{selected_name_base}.pdf", use_container_width=True, disabled=not resume_text_export)
-        with c2:
-            st.markdown("#### Cover Letter")
-            st.download_button("✉️ Download DOCX", data=format_docx_stable(cover_letter_export, primary_backend, keys), file_name=f"Cover_Letter_{selected_name_base}.docx", use_container_width=True, disabled=not cover_letter_export)
-            st.download_button("📝 Download PDF", data=format_pdf_stable(cover_letter_export, primary_backend, keys), file_name=f"Cover_Letter_{selected_name_base}.pdf", use_container_width=True, disabled=not cover_letter_export)
+    tailored_text = st.session_state.get("tailored_text", "")
+    st.text_area("Tailored resume (plain text)", value=tailored_text, height=420)
 
+    colx1, colx2 = st.columns(2)
+    with colx1:
+        if tailored_text and st.button("⬇️ Export DOCX"):
+            out_path = export_docx(tailored_text, "tailored_resume.docx")
+            with open(out_path, "rb") as f:
+                st.download_button("Download DOCX", f, file_name="tailored_resume.docx")
+    with colx2:
+        if tailored_text and st.button("⬇️ Export PDF (professional)"):
+            out_path = export_pdf(tailored_text, "tailored_resume.pdf")
+            with open(out_path, "rb") as f:
+                st.download_button("Download PDF", f, file_name="tailored_resume.pdf")
 else:
-    st.info("👋 Welcome! Upload your resume, paste a job description, and click 'Analyze' to begin.")
+    st.info("Upload or paste both the Resume and the Job Description to begin.")
