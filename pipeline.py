@@ -199,7 +199,22 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
 
 def tailor(resume_text: str, jd_text: str, provider_preference: str = None, model_name: str = None, temperature: float = 0.2, max_tokens: int = 1500, keys: Dict[str,str] = None, target_keywords: Optional[List[str]] = None, override_contacts: Optional[Dict[str,str]] = None) -> str:
     provider = _provider_from_keys(provider_preference, keys or {})
-    kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
+
+    # Deduplicate target keywords using the SAME tokenizer as extractor
+    token_re = re.compile(r"[A-Za-z0-9#+.]+")
+    def _canon(s: str) -> str:
+        return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+    seen = set()
+    allowed = []
+    for k in (target_keywords or []):
+        c = _canon(k)
+        if c and c not in seen:
+            seen.add(c)
+            allowed.append(k)
+
+    kw_blob = "\n".join(f"- {k}" for k in allowed)
+
     contacts = override_contacts if override_contacts is not None else extract_contacts_regex(resume_text)
     contact_block = f"""name={contacts.get('name','')}
 email={contacts.get('email','')}

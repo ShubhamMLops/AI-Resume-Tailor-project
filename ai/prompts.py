@@ -4,11 +4,14 @@ OBJECTIVE
 - Produce a polished, section-structured resume aligned to the JD.
 - Integrate target keywords naturally across sections.
 - Use ONLY facts from the original resume; reword/reorder ok, no fabrication.
+- Use ONLY the TARGET KEYWORDS provided by the system/user prompts. Do NOT introduce any keyword that is not in TARGET KEYWORDS.
+- MUST COVER EVERY TARGET KEYWORD at least once: if not evidenced in the resume, include it in Core Competencies with a concise, role-aligned one-line definition.
 
 STYLE
 - Bullets: action-first, quantified where possible, <= 22 words.
 - Sections: Profile Summary, Core Skills, Core Competencies, Technical Skills, Work Experience, Education, Certifications, Projects (optional).
 - Output PLAIN TEXT only (no markdown markers, no code fences)."""
+
 
 USER_TAILOR = """JOB DESCRIPTION (verbatim):
 {jd}
@@ -20,11 +23,17 @@ TARGET KEYWORDS (ranked or curated):
 {keywords}
 
 TASK:
-Return a structured resume as plain text with section headings from the style above and bullet lines starting with '• '."""
+Return a structured resume as plain text with section headings from the style above and bullet lines starting with '• '.
+HARD CONSTRAINTS:
+- Weave ONLY the TARGET KEYWORDS; do not add synonyms or extra terms beyond the list.
+- If a target keyword is not evidenced by the resume, include it in 'Core Competencies' with a concise, role-aligned one-line definition (no false claims of usage/ownership).
+- Ensure EVERY TARGET KEYWORD appears at least once somewhere appropriate."""
 
 SYSTEM_TAILOR_JSON = """You are a resume tailoring assistant.
 Return STRICT JSON ONLY (no prose).
 Use ONLY facts from the original resume.
+Weave ONLY the TARGET KEYWORDS provided; do not add other keywords.
+Ensure EVERY TARGET KEYWORD appears at least once; if unevidenced, place it in 'core_competencies' with a concise, role-aligned definition.
 Schema:
 {
  "header": {"name": str, "email": str, "phone": str, "linkedin": str, "github": str},
@@ -57,7 +66,10 @@ KNOWN CONTACT DETAILS (use only if present):
 TARGET KEYWORDS:
 {keywords}
 
-Return the JSON object only."""
+Return the JSON object only. HARD CONSTRAINTS:
+- Use ONLY keywords from TARGET KEYWORDS; do not add others.
+- Ensure EVERY TARGET KEYWORD appears at least once; if not evidenced by the resume, include a one-line role-aligned definition in 'core_competencies' (no fabricated achievements)."""
+
 
 SYSTEM_KEYWORDS = """Extract ranked, canonical job keywords. Return STRICT JSON.
 Fields:

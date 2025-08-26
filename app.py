@@ -1,4 +1,4 @@
-import io, os, json
+import io, os, json, re
 import streamlit as st
 from pipeline import analyze, tailor, extract_keywords_llm, extract_contacts_llm, sanitize_markdown
 from utils import export_docx, export_pdf
@@ -115,19 +115,15 @@ if resume_text.strip() and jd_text.strip():
         - missing: token gaps from JD vs resume (bag-of-words)
         - weak: LLM keyword terms that appear only once (or barely) in resume
         """
-        # Try to reuse analysis BOW gaps (computed earlier)
-        # If you don't have 'report' in scope here, move this function above where 'report' is defined, or pass the gaps in.
         try:
             from ai.matcher import re as _re  # not used, but ensures import path correct
         except Exception:
             pass
 
         # 1) Missing fallback via analyze()’s BOW gaps:
-        # 'report' is defined earlier in this script when we ran analyze(resume_text, jd_text)
         missing_terms = []
         try:
             bow_missing = [w for (w, _) in (report["keywords_bow"]["missing"] or [])]
-            # De-duplicate + keep only meaningful tokens (length > 2)
             seen = set()
             for w in bow_missing:
                 wl = w.lower().strip()
@@ -141,7 +137,6 @@ if resume_text.strip() and jd_text.strip():
         weak_terms = []
         try:
             text_low = " " + resume_text.lower() + " "
-            # normalize spaces
             text_low = " ".join(text_low.split())
             terms = [ (item.get("term") or "").strip() for item in (kw_obj.get("keywords") or []) ]
             seen2 = set()
@@ -150,10 +145,9 @@ if resume_text.strip() and jd_text.strip():
                 if not tl or tl in seen2:
                     continue
                 seen2.add(tl)
-                count = text_low.count(" " + tl + " ")  # crude but effective for single/multi-word terms
+                count = text_low.count(" " + tl + " ")
                 if count == 1:
                     weak_terms.append(t)
-            # cap
             weak_terms = weak_terms[:20]
         except Exception:
             weak_terms = []
@@ -179,7 +173,6 @@ if resume_text.strip() and jd_text.strip():
             st.markdown("**Gaps**")
             missing = kw_obj.get("missing")
             weak = kw_obj.get("weak")
-            # Fallback compute if fields are absent or empty
             if not missing or not isinstance(missing, list) or not weak or not isinstance(weak, list):
                 fallback_missing, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
                 if not missing or not isinstance(missing, list):
@@ -198,16 +191,43 @@ if resume_text.strip() and jd_text.strip():
     if st.button("Generate tailored resume", type="primary"):
         try:
             target = []
-            if auto_weave and kw_obj and kw_obj.get("keywords"):
-                for item in kw_obj["keywords"][:15]:
-                    term = (item.get("term") or "").strip()
-                    if term and term.lower() not in [t.lower() for t in target]:
-                        target.append(term)
+
+            # --- Build from Top Keywords (ranked) + Gaps, deduped with same tokenizer as extractor ---
+            if kw_obj:
+                # same matcher tokenizer
+                token_re = re.compile(r"[A-Za-z0-9#+.]+")
+                def _canon(s: str) -> str:
+                    return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+                ranked_terms = []
+                if kw_obj.get("keywords"):
+                    for item in kw_obj["keywords"]:
+                        term = (item.get("term") or "").strip()
+                        if term:
+                            ranked_terms.append(term)
+
+                gaps_terms = list(kw_obj.get("missing") or [])
+                if not gaps_terms:
+                    fallback_missing, _fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
+                    gaps_terms = list(fallback_missing or [])
+
+                seen = set()
+                for t in ranked_terms + gaps_terms:
+                    c = _canon(t)
+                    if c and c not in seen:
+                        seen.add(c)
+                        target.append(t)
+
+            # Optional: still allow user-provided extras if they insist
             if custom_keywords.strip():
                 for t in custom_keywords.split(","):
                     term = t.strip()
                     if term and term.lower() not in [x.lower() for x in target]:
                         target.append(term)
+
+            # If user unchecks auto_weave, respect it (don’t pass keywords automatically)
+            if not auto_weave:
+                target = []
 
             override_contacts = st.session_state.get("override_contacts")
             tailored = tailor(resume_text, jd_text, provider_preference=provider, model_name=(model or None),
