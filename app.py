@@ -94,26 +94,104 @@ if resume_text.strip() and jd_text.strip():
         for w in report["ats"]["warnings"]:
             st.write(f"• {w}")
 
-    st.markdown("---")
-    st.subheader("AI Keywords (optional)")
-    if st.button("Extract AI keywords now"):
+    # LLM-powered keywords (JSON)
+    st.subheader("LLM Keyword Optimizer")
+    if st.button("Extract ranked keywords with AI"):
         try:
-            ai_kw = extract_keywords_llm(resume_text, jd_text, provider_pref=provider, model_name=(model or None), temperature=temperature, max_tokens=min(max_tokens, 1200), keys=keys)
-            st.session_state["kw_llm"] = ai_kw
-            st.success("Keywords extracted.")
+            kw = extract_keywords_llm(
+                resume_text, jd_text,
+                provider_pref=provider, model_name=(model or None),
+                temperature=temperature, max_tokens=min(max_tokens, 1200), keys=keys
+            )
+            st.session_state["kw_llm"] = kw
         except Exception as e:
             st.error(str(e))
 
     kw_obj = st.session_state.get("kw_llm")
-    if kw_obj and kw_obj.get("keywords"):
+
+    def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
+        """
+        If the model didn't return 'missing'/'weak', compute a sensible fallback:
+        - missing: token gaps from JD vs resume (bag-of-words)
+        - weak: LLM keyword terms that appear only once (or barely) in resume
+        """
+        # Try to reuse analysis BOW gaps (computed earlier)
+        # If you don't have 'report' in scope here, move this function above where 'report' is defined, or pass the gaps in.
+        try:
+            from ai.matcher import re as _re  # not used, but ensures import path correct
+        except Exception:
+            pass
+
+        # 1) Missing fallback via analyze()’s BOW gaps:
+        # 'report' is defined earlier in this script when we ran analyze(resume_text, jd_text)
+        missing_terms = []
+        try:
+            bow_missing = [w for (w, _) in (report["keywords_bow"]["missing"] or [])]
+            # De-duplicate + keep only meaningful tokens (length > 2)
+            seen = set()
+            for w in bow_missing:
+                wl = w.lower().strip()
+                if len(wl) > 2 and wl not in seen:
+                    seen.add(wl); missing_terms.append(w)
+            missing_terms = missing_terms[:20]
+        except Exception:
+            missing_terms = []
+
+        # 2) Weak fallback using the LLM’s keyword list (terms that appear once in resume)
+        weak_terms = []
+        try:
+            text_low = " " + resume_text.lower() + " "
+            # normalize spaces
+            text_low = " ".join(text_low.split())
+            terms = [ (item.get("term") or "").strip() for item in (kw_obj.get("keywords") or []) ]
+            seen2 = set()
+            for t in terms:
+                tl = t.lower()
+                if not tl or tl in seen2:
+                    continue
+                seen2.add(tl)
+                count = text_low.count(" " + tl + " ")  # crude but effective for single/multi-word terms
+                if count == 1:
+                    weak_terms.append(t)
+            # cap
+            weak_terms = weak_terms[:20]
+        except Exception:
+            weak_terms = []
+
+        return missing_terms, weak_terms
+
+    if kw_obj:
         st.write(kw_obj.get("summary",""))
-        for item in kw_obj["keywords"][:15]:
-            st.write(f"{item.get('rank')}. {item.get('term')}")
+        colk1, colk2 = st.columns(2)
+        with colk1:
+            st.markdown("**Top Keywords (ranked)**")
+            if kw_obj.get("keywords"):
+                for item in kw_obj["keywords"]:
+                    term = item.get("term")
+                    cat = item.get("category","general")
+                    variants = item.get("variants", [])
+                    rank = item.get("rank")
+                    suffix = f" · variants: {', '.join(variants)}" if variants else ""
+                    st.write(f"{rank}. **{term}** · _{cat}_{suffix}")
+            else:
+                st.write("No keywords returned.")
+        with colk2:
+            st.markdown("**Gaps**")
+            missing = kw_obj.get("missing")
+            weak = kw_obj.get("weak")
+            # Fallback compute if fields are absent or empty
+            if not missing or not isinstance(missing, list) or not weak or not isinstance(weak, list):
+                fallback_missing, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
+                if not missing or not isinstance(missing, list):
+                    missing = fallback_missing
+                if not weak or not isinstance(weak, list):
+                    weak = fallback_weak
+
+            st.write("Missing:", ", ".join(missing) if missing else "—")
+            st.write("Weak:", ", ".join(weak) if weak else "—")
 
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    st.caption("Enhanced v8: reliable header, clean sections, colored headings in exports.")
-
     auto_weave = st.checkbox("Use AI keywords automatically", value=True)
     custom_keywords = st.text_input("Optional: comma-separated custom keywords")
 
