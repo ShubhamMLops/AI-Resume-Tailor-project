@@ -1,4 +1,3 @@
-
 # 🚀 AI Resume Tailor (v8 Final)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
@@ -63,10 +62,9 @@ This tool automates the process by combining **LLM intelligence** with ATS check
    ```bash
    git clone https://github.com/your-username/ai-resume-tailor-v8-final.git
    cd ai-resume-tailor-v8-final
-````
+   ```
 
 2. Create and activate a virtual environment:
-
    ```bash
    # macOS/Linux
    python3 -m venv venv
@@ -78,13 +76,11 @@ This tool automates the process by combining **LLM intelligence** with ATS check
    ```
 
 3. Install dependencies:
-
    ```bash
    pip install -r requirements.txt
    ```
 
 4. Run the app:
-
    ```bash
    streamlit run app.py
    ```
@@ -96,10 +92,9 @@ This tool automates the process by combining **LLM intelligence** with ATS check
 ## ⚙️ Configuration
 
 All configuration is handled in the **sidebar**:
-
-* **API Keys**: Paste your key for OpenAI, Gemini, or Anthropic.
-* **Provider & Model**: Choose your provider and optionally set a model name.
-* **Parameters**: Adjust `temperature` and `max tokens`.
+- **API Keys**: Paste your key for OpenAI, Gemini, or Anthropic.
+- **Provider & Model**: Choose your provider and optionally set a model name.
+- **Parameters**: Adjust `temperature` and `max tokens`.
 
 ---
 
@@ -123,24 +118,17 @@ All configuration is handled in the **sidebar**:
 
 ## 🤝 Contributing
 
-Contributions are welcome!
+Contributions are welcome!  
 To contribute:
 
-1. Fork this repo
-2. Create a feature branch (`git checkout -b feature/NewFeature`)
-3. Commit changes (`git commit -m 'Add new feature'`)
-4. Push to branch (`git push origin feature/NewFeature`)
-5. Open a Pull Request
+1. Fork this repo  
+2. Create a feature branch (`git checkout -b feature/NewFeature`)  
+3. Commit changes (`git commit -m 'Add new feature'`)  
+4. Push to branch (`git push origin feature/NewFeature`)  
+5. Open a Pull Request  
 
 ---
 
 ## 📜 License
 
 This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
-
-```
-
----
-
-Would you like me to **inject this README.md** directly into your `v8_final.zip` (so you get a ready-to-go package), or just keep it here for you to paste manually?
-```
