@@ -1,14 +1,22 @@
 import io, os, json, re
 import streamlit as st
-from pipeline import analyze, tailor, extract_keywords_llm, extract_contacts_llm, sanitize_markdown
 from utils import export_docx, export_pdf
-from pipeline import analyze, tailor, extract_keywords_llm, extract_contacts_llm, sanitize_markdown, extract_ats_llm
-
+from pipeline import (
+    analyze,
+    tailor,
+    extract_keywords_llm,
+    extract_contacts_llm,
+    sanitize_markdown,
+    extract_ats_llm_from_optimizer,  # AI ATS helper
+)
 
 st.set_page_config(page_title="API-only Resume Tailor (v8 final)", page_icon="🧰", layout="wide")
 st.title("🧰 API-only Resume Tailor (v8 final)")
 st.caption("v8 layout • Full content read • Colored headings in DOCX/PDF • Plain-text output (no ##/**)")
 
+# -------------------------
+# Sidebar
+# -------------------------
 with st.sidebar:
     st.header("🔑 Provider & Model")
     provider = st.selectbox("Provider", ["openai","gemini","anthropic"], index=1)
@@ -22,6 +30,9 @@ with st.sidebar:
     anthropic_key = st.text_input("Anthropic API Key", type="password")
     keys = {"openai": openai_key.strip(), "gemini": gemini_key.strip(), "anthropic": anthropic_key.strip()}
 
+# -------------------------
+# Upload or paste helper
+# -------------------------
 def read_textarea_or_file(label: str, key_text: str, key_file: str) -> str:
     txt = st.session_state.get(key_text, "")
     up = st.file_uploader(label, type=["txt","md","pdf","docx"], key=key_file)
@@ -44,7 +55,6 @@ def read_textarea_or_file(label: str, key_text: str, key_file: str) -> str:
             from docx import Document
             d = Document(up)
             paras = [p.text for p in d.paragraphs]
-            # include docx table text
             for tbl in d.tables:
                 for row in tbl.rows:
                     paras.append(" | ".join(cell.text for cell in row.cells))
@@ -52,6 +62,9 @@ def read_textarea_or_file(label: str, key_text: str, key_file: str) -> str:
     txt = st.text_area(f"Or paste {label.lower()} text here", value=txt, height=240, key=key_text)
     return txt
 
+# -------------------------
+# Inputs
+# -------------------------
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("Resume")
@@ -60,26 +73,30 @@ with col2:
     st.subheader("Job Description")
     jd_text = read_textarea_or_file("Job Description", "jd_text", "jd_file")
 
-# (1) Always use the visible paste boxes as the source of truth for AI steps
+# Always use text boxes as source of truth
 resume_text = st.session_state.get("resume_text", "") or resume_text
 jd_text = st.session_state.get("jd_text", "") or jd_text
 
+# -------------------------
+# Main
+# -------------------------
 if resume_text.strip() and jd_text.strip():
     st.divider()
     st.subheader("Analysis")
 
     report = analyze(resume_text, jd_text)
 
-    # Contacts (regex + optional AI + manual)
     if st.button("Enhance contacts with AI"):
         try:
-            st.session_state["ai_contacts"] = extract_contacts_llm(resume_text, provider_pref=provider, model_name=(model or None), keys=keys)
+            st.session_state["ai_contacts"] = extract_contacts_llm(
+                resume_text, provider_pref=provider, model_name=(model or None), keys=keys
+            )
             st.success("Contacts enhanced.")
         except Exception as e:
             st.error(str(e))
 
     ai_contacts = st.session_state.get("ai_contacts", {})
-    merged = {**report["contacts"], **{k: v for k,v in ai_contacts.items() if v}}
+    merged = {**report["contacts"], **{k: v for k, v in ai_contacts.items() if v}}
 
     st.markdown("**Contacts**")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -91,16 +108,16 @@ if resume_text.strip() and jd_text.strip():
     st.session_state["override_contacts"] = merged
 
     cA, cB, cC = st.columns([1,1,2])
-    with cA:
-        st.metric("Match Score", f"{report['match']['match_score']}%")
-    with cB:
-        st.metric("Readability (FRE)", report["readability"]["flesch_reading_ease"])
+    with cA: st.metric("Match Score", f"{report['match']['match_score']}%")
+    with cB: st.metric("Readability (FRE)", report["readability"]["flesch_reading_ease"])
     with cC:
         st.write("ATS warnings:")
         for w in report["ats"]["warnings"]:
             st.write(f"• {w}")
 
-    # LLM-powered keywords (JSON)
+    # -----------------
+    # LLM Keyword Optimizer
+    # -----------------
     st.subheader("LLM Keyword Optimizer")
     if st.button("Extract ranked keywords with AI"):
         try:
@@ -116,17 +133,6 @@ if resume_text.strip() and jd_text.strip():
     kw_obj = st.session_state.get("kw_llm")
 
     def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
-        """
-        If the model didn't return 'missing'/'weak', compute a sensible fallback:
-        - missing: token gaps from JD vs resume (bag-of-words)
-        - weak: LLM keyword terms that appear only once (or barely) in resume
-        """
-        try:
-            from ai.matcher import re as _re  # not used, but ensures import path correct
-        except Exception:
-            pass
-
-        # 1) Missing fallback via analyze()’s BOW gaps:
         missing_terms = []
         try:
             bow_missing = [w for (w, _) in (report["keywords_bow"]["missing"] or [])]
@@ -139,26 +145,108 @@ if resume_text.strip() and jd_text.strip():
         except Exception:
             missing_terms = []
 
-        # 2) Weak fallback using the LLM’s keyword list (terms that appear once in resume)
         weak_terms = []
         try:
-            text_low = " " + resume_text.lower() + " "
-            text_low = " ".join(text_low.split())
-            terms = [ (item.get("term") or "").strip() for item in (kw_obj.get("keywords") or []) ]
+            text_low = " " + " ".join(resume_text.lower().split()) + " "
+            terms = [(item.get("term") or "").strip() for item in (kw_obj.get("keywords") or [])]
             seen2 = set()
             for t in terms:
                 tl = t.lower()
-                if not tl or tl in seen2:
-                    continue
+                if not tl or tl in seen2: continue
                 seen2.add(tl)
-                count = text_low.count(" " + tl + " ")
-                if count == 1:
+                if text_low.count(" " + tl + " ") == 1:
                     weak_terms.append(t)
             weak_terms = weak_terms[:20]
         except Exception:
             weak_terms = []
-
         return missing_terms, weak_terms
+
+    # === ADDED: helper to build target keywords from Top Keywords (ranked) + Gaps, deduped, and excluding ones already in resume ===
+    def build_target_keywords_from_optimizer(kw_obj, resume_text: str, jd_text: str):
+        """
+        Build final target keywords from:
+        - Top Keywords (ranked) + ALL their variants (outlets)
+        - Gaps (missing) or fallback
+        Then:
+        - Dedupe canonically (punctuation/case insensitive)
+        - EXCLUDE anything already present in the ORIGINAL resume
+            (match against term OR any variant; handles 'CI/CD' ~ 'cicd' and simple plural/singular)
+        """
+        if not kw_obj:
+            return []
+
+        token_re = re.compile(r"[A-Za-z0-9#+.]+")
+
+        def _canon(s: str) -> str:
+            return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+        def _tok_seq(s: str):
+            return [t.lower() for t in token_re.findall(s or "")]
+
+        # Resume tokens + compacted view (for CI/CD ~ cicd)
+        resume_tokens = _tok_seq(resume_text)
+        resume_compact = "".join(resume_tokens)
+
+        def _present(term: str) -> bool:
+            kt = _tok_seq(term)
+            if not kt:
+                return False
+            L = len(kt)
+
+            # A) exact token-sequence
+            for i in range(0, len(resume_tokens) - L + 1):
+                if resume_tokens[i:i+L] == kt:
+                    return True
+
+            # B) compacted (handles CI/CD -> cicd)
+            k_comp = "".join(kt)
+            if k_comp and k_comp in resume_compact:
+                return True
+
+            # C) simple plural/singular toggle (avoid breaking short acronyms)
+            if L == 1 and len(kt[0]) > 3:
+                base = kt[0]
+                alt = base[:-1] if base.endswith("s") else base + "s"
+                if base in resume_tokens or alt in resume_tokens:
+                    return True
+
+            return False
+
+        # (1) Collect ALL outlets: each Top Keyword (ranked) followed by its variants
+        outlets_ordered = []
+        for item in (kw_obj.get("keywords") or []):
+            base = (item.get("term") or "").strip()
+            if not base:
+                continue
+            variants = [v.strip() for v in (item.get("variants") or []) if v and v.strip()]
+            outlets_ordered.append(base)           # base first
+            outlets_ordered.extend(variants)       # then all variants
+
+        # (2) Append Gaps (or fallback if empty)
+        gaps_terms = list(kw_obj.get("missing") or [])
+        if not gaps_terms:
+            try:
+                fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
+            except Exception:
+                fallback_missing = []
+            gaps_terms = list(fallback_missing or [])
+        for g in gaps_terms:
+            g = (g or "").strip()
+            if g:
+                outlets_ordered.append(g)
+
+        # (3) Dedupe by canonical form while preserving order
+        seen, deduped = set(), []
+        for t in outlets_ordered:
+            c = _canon(t)
+            if c and c not in seen:
+                seen.add(c)
+                deduped.append(t)
+
+        # (4) Remove anything already present in the original resume
+        target = [t for t in deduped if not _present(t)]
+        return target
+    # === END REPLACE ===
 
     if kw_obj:
         st.write(kw_obj.get("summary",""))
@@ -181,323 +269,194 @@ if resume_text.strip() and jd_text.strip():
             weak = kw_obj.get("weak")
             if not missing or not isinstance(missing, list) or not weak or not isinstance(weak, list):
                 fallback_missing, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                if not missing or not isinstance(missing, list):
-                    missing = fallback_missing
-                if not weak or not isinstance(weak, list):
-                    weak = fallback_weak
-
+                if not missing or not isinstance(missing, list): missing = fallback_missing
+                if not weak or not isinstance(weak, list): weak = fallback_weak
             st.write("Missing:", ", ".join(missing) if missing else "—")
             st.write("Weak:", ", ".join(weak) if weak else "—")
 
+    # -----------------
+    # Tailor with LLM (Top Keywords (ranked) + Gaps) — no duplication
+    # -----------------
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    st.caption("Uses ONLY optimizer keywords; removes those already present in the resume.")
+    st.caption("Uses ONLY Top Keywords (ranked) + Gaps from the LLM Keyword Optimizer; removes those already present in the resume.")
 
-    # Disable generation until optimizer has run
+    # Enable only if the optimizer has Top Keywords (ranked) or Gaps
     can_generate = bool(st.session_state.get("kw_llm", {}).get("keywords") or st.session_state.get("kw_llm", {}).get("missing"))
     if st.button("Generate tailored resume", type="primary", disabled=not can_generate):
         try:
             target = []
-
-            # --- Build from Top Keywords (ranked) + Gaps, dedupe with same tokenizer, then filter out ones already in resume ---
+            kw_obj = st.session_state.get("kw_llm")  # ensure we read the latest
             if kw_obj:
-                token_re = re.compile(r"[A-Za-z0-9#+.]+")
-                def _canon(s: str) -> str:
-                    return " ".join(t.lower() for t in token_re.findall(s or ""))
-
-                def _has_term(text: str, term: str) -> bool:
-                    tt = token_re.findall((text or "").lower())
-                    kt = token_re.findall((term or "").lower())
-                    if not kt:
-                        return False
-                    L = len(kt)
-                    for i in range(0, len(tt) - L + 1):
-                        if tt[i:i+L] == kt:
-                            return True
-                    return False
-
-                ranked_terms = []
-                if kw_obj.get("keywords"):
-                    for item in kw_obj["keywords"]:
-                        term = (item.get("term") or "").strip()
-                        if term:
-                            ranked_terms.append(term)
-
-                gaps_terms = list(kw_obj.get("missing") or [])
-                if not gaps_terms:
-                    fallback_missing, _fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                    gaps_terms = list(fallback_missing or [])
-
-                # Dedupe first (ranked then gaps)
-                seen = set()
-                deduped = []
-                for t in ranked_terms + gaps_terms:
-                    c = _canon(t)
-                    if c and c not in seen:
-                        seen.add(c)
-                        deduped.append(t)
-
-                # Filter out keywords that already appear in the ORIGINAL resume (A ∩ B)
-                target = [t for t in deduped if not _has_term(resume_text, t)]
+                # Build target keywords from Top Keywords (ranked) + Gaps, deduped,
+                # and excluding anything already present in the original resume
+                target = build_target_keywords_from_optimizer(kw_obj, resume_text, jd_text)
 
             override_contacts = st.session_state.get("override_contacts")
-            tailored = tailor(resume_text, jd_text, provider_preference=provider, model_name=(model or None),
-                              temperature=temperature, max_tokens=max_tokens, keys=keys,
-                              target_keywords=target, override_contacts=override_contacts)
+            tailored = tailor(
+                resume_text,
+                jd_text,
+                provider_preference=provider,
+                model_name=(model or None),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                keys=keys,
+                target_keywords=target,  # <-- ONLY Top Keywords (ranked) + Gaps (filtered)
+                override_contacts=override_contacts
+            )
 
-            # Update stored + editor text; require Save for export
             final_txt = sanitize_markdown(tailored)
             st.session_state["tailored_text"] = final_txt
-            if "tailored_edit" not in st.session_state or not st.session_state["tailored_edit"]:
-                st.session_state["tailored_edit"] = final_txt
-            else:
-                # refresh editor with new generation (so users can edit immediately)
-                st.session_state["tailored_edit"] = final_txt
+            st.session_state["tailored_edit"] = final_txt
             st.session_state["tailored_saved"] = False
-
-            st.success("Tailored resume generated. Review and click Save before exporting.")
+            st.success("Tailored resume generated from Top Keywords (ranked) + Gaps. Review and click Save before exporting.")
         except Exception as e:
             st.error(str(e))
 
-    # (2) Editable tailored text area + Save button; exports use saved text
+    # Editor + Save
     if "tailored_edit" not in st.session_state:
         st.session_state["tailored_edit"] = st.session_state.get("tailored_text", "")
-
     edited_text = st.text_area("Tailored resume (plain text)", key="tailored_edit", height=420)
 
     if st.button("💾 Save"):
         st.session_state["tailored_text"] = (edited_text or "").strip()
         st.session_state["tailored_saved"] = True
         st.success("Saved. Exports will use your edited text.")
-    # # --- ATS Scan on the edited (final) resume text ---
-    # st.divider()
-    # st.subheader("ATS Scan (Keyword Coverage vs Final Resume)")
 
-    # use_ai_ats = st.checkbox("Use AI-powered ATS (LLM)", value=True, help="Uncheck to run fast local rule-based scan.")
-
-    # if st.button("Run ATS analysis on edited resume"):
-    #     final_text = (st.session_state.get("tailored_edit", "") or "").strip()
-    #     if not final_text:
-    #         st.warning("Please add or generate resume content first.")
-    #     else:
-    #         if use_ai_ats:
-    #             ats_llm = extract_ats_llm(final_text, jd_text, provider_pref=provider, model_name=(model or None),
-    #                                     temperature=temperature, max_tokens=max_tokens, keys=keys)
-    #             st.session_state["final_ats_llm"] = ats_llm
-    #             st.session_state["final_ats_report"] = None  # clear rule-based
-    #         else:
-    #             final_ats = analyze(final_text, jd_text)  # local, rule-based
-    #             st.session_state["final_ats_report"] = final_ats
-    #             st.session_state["final_ats_llm"] = None    # clear AI
-
-    # # Display results
-    # ats_llm = st.session_state.get("final_ats_llm")
-    # final_ats = st.session_state.get("final_ats_report")
-
-    # if use_ai_ats and ats_llm:
-    #     c1, c2 = st.columns([1,2])
-    #     with c1:
-    #         st.metric("AI ATS Score", f"{ats_llm.get('score',0)}%")
-    #     with c2:
-    #         st.write("Suggestions:")
-    #         for s in (ats_llm.get("suggestions") or []):
-    #             st.write(f"• {s}")
-    #     st.write("Strengths:")
-    #     for s in (ats_llm.get("strengths") or []):
-    #         st.write(f"• {s}")
-    #     st.write("Gaps:")
-    #     for g in (ats_llm.get("gaps") or []):
-    #         st.write(f"• {g}")
-    #     st.write("Missing keywords:", ", ".join(ats_llm.get("missing_keywords") or []) or "—")
-
-    # elif (not use_ai_ats) and final_ats:
-    #     c1, c2, c3 = st.columns([1, 1, 2])
-    #     with c1:
-    #         st.metric("Match Score (final)", f"{final_ats['match']['match_score']}%")
-    #     with c2:
-    #         st.metric("Readability (FRE)", final_ats["readability"]["flesch_reading_ease"])
-    #     with c3:
-    #         st.write("ATS warnings:")
-    #         for w in final_ats["ats"]["warnings"]:
-    #             st.write(f"• {w}")
-    #     try:
-    #         missing = [w for (w, _) in (final_ats["keywords_bow"]["missing"] or [])]
-    #     except Exception:
-    #         missing = []
-    #     st.write("Top missing keywords:", ", ".join(missing[:20]) if missing else "—")
-    # --- ATS Scan on the edited (final) resume text ---
+    # -----------------
+    # ATS Scan (AI) + local reconciliation
+    # -----------------
     st.divider()
     st.subheader("ATS Scan (Keyword Coverage vs Final Resume)")
 
-    use_ai_ats = st.checkbox("Use AI-powered ATS (LLM)", value=True,
-                            help="Uncheck to run fast local rule-based scan against the JD.")
-
     if st.button("Run ATS analysis on edited resume"):
         final_text = (st.session_state.get("tailored_edit", "") or "").strip()
-        kw_obj = st.session_state.get("kw_llm") or {}
+        kw_obj_now = st.session_state.get("kw_llm") or {}
 
         if not final_text:
             st.warning("Please add or generate resume content first.")
+        elif not kw_obj_now:
+            st.warning("Please run the LLM Keyword Optimizer first.")
         else:
-            if use_ai_ats:
-                # Build keyword list from Optimizer output: ranked terms + gaps (missing), then dedupe
-                token_re = re.compile(r"[A-Za-z0-9#+.]+")
-                def _canon(s: str) -> str:
-                    return " ".join(t.lower() for t in token_re.findall(s or ""))
+            ats_llm = extract_ats_llm_from_optimizer(
+                resume_text=final_text,
+                optimizer_obj=kw_obj_now,
+                provider_pref=provider,
+                model_name=(model or None),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                keys=keys,
+                jd_text=jd_text
+            )
+            st.session_state["final_ats_llm"] = ats_llm
 
-                ranked = []
-                for item in (kw_obj.get("keywords") or []):
-                    term = (item.get("term") or "").strip()
-                    if term:
-                        ranked.append(term)
+            # Reconcile deterministically (token/variant aware + compacted match)
+            token_re = re.compile(r"[A-Za-z0-9#+.]+")
+            def _canon(s: str) -> str:
+                return " ".join(t.lower() for t in token_re.findall(s or ""))
 
-                gaps = list(kw_obj.get("missing") or [])
+            ranked = [(it.get("term") or "").strip() for it in (kw_obj_now.get("keywords") or []) if (it.get("term") or "").strip()]
+            gaps = list(kw_obj_now.get("missing") or [])
 
-                seen = set()
-                target_keywords = []
-                for t in (ranked + gaps):
-                    c = _canon(t)
-                    if c and c not in seen:
-                        seen.add(c)
-                        target_keywords.append(t)
+            seen_terms, ordered_terms = set(), []
+            for t in (ranked + gaps):
+                c = _canon(t)
+                if c and c not in seen_terms:
+                    seen_terms.add(c); ordered_terms.append(t)
 
-                if not target_keywords:
-                    st.warning("No optimizer keywords available. Please run the LLM Keyword Optimizer first.")
+            # Variants map
+            variants_map = {}
+            for it in (kw_obj_now.get("keywords") or []):
+                term = (it.get("term") or "").strip()
+                if term:
+                    variants_map[_canon(term)] = [v.strip() for v in (it.get("variants") or []) if v and v.strip()]
+
+            final_tokens = [t.lower() for t in token_re.findall(final_text)]
+            final_compact = "".join(final_tokens)
+
+            def _tok_seq(s: str):
+                return [t.lower() for t in token_re.findall(s or "")]
+
+            present, missing, coverage = [], [], []
+            for term in ordered_terms:
+                cand_list = [term] + (variants_map.get(_canon(term), []))
+                found = False
+                found_pos = -1
+                found_len = 0
+
+                for cand in cand_list:
+                    tt = _tok_seq(cand)
+                    if not tt:
+                        continue
+
+                    # A) exact token-sequence match
+                    L = len(tt)
+                    for i in range(0, len(final_tokens) - L + 1):
+                        if final_tokens[i:i+L] == tt:
+                            found, found_pos, found_len = True, i, L
+                            break
+                    if found:
+                        break
+
+                    # B) compacted form (CI/CD -> cicd)
+                    t_comp = "".join(tt)
+                    if t_comp and t_comp in final_compact:
+                        found, found_pos, found_len = True, -1, L
+                        break
+
+                    # C) single-word plural/singular toggle for simple drift (avoid short acronyms)
+                    if L == 1 and len(tt[0]) > 3:
+                        base = tt[0]
+                        alt = base[:-1] if base.endswith("s") else base + "s"
+                        if base in final_tokens or alt in final_tokens:
+                            found, found_pos, found_len = True, -1, 1
+                            break
+
+                if found:
+                    # evidence (best-effort)
+                    if found_pos >= 0:
+                        spans = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-z0-9#+.]+", final_text)]
+                        s = spans[found_pos][1] if 0 <= found_pos < len(spans) else 0
+                        e_idx = min(found_pos + max(1, found_len) - 1, len(spans) - 1)
+                        e = spans[e_idx][2] if spans else s
+                        s = max(0, s - 20); e = min(len(final_text), e + 20)
+                        ev = final_text[s:e].replace("\n", " ").strip()
+                    else:
+                        ev = ""  # compact/toggled match; snippet not locatable
+                    present.append(term)
+                    coverage.append({"term": term, "present": True, "evidence": ev})
                 else:
-                    # IMPORTANT: pass the keyword list (NOT jd_text) to the LLM ATS
-                    ats_llm = extract_ats_llm(
-                        final_text,
-                        target_keywords,
-                        provider_pref=provider,
-                        model_name=(model or None),
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        keys=keys
-                    )
-                    st.session_state["final_ats_llm"] = ats_llm
-                    st.session_state["final_ats_report"] = None  # clear rule-based
-                    # --- Reconcile LLM ATS with local robust matching (fix false 'missing') ---
-                    final_text = (st.session_state.get("tailored_edit", "") or "").strip()
-                    kw_obj = st.session_state.get("kw_llm") or {}
+                    missing.append(term)
+                    coverage.append({"term": term, "present": False, "evidence": ""})
 
-                    # Build a mapping term -> variants (from Optimizer), keep order of terms we sent
-                    token_re = re.compile(r"[A-Za-z0-9#+.]+")
-                    def _canon(s: str) -> str:
-                        return " ".join(t.lower() for t in token_re.findall(s or ""))
+            total = max(1, len(ordered_terms))
+            score = round(100 * len(present) / total)
+            st.session_state["final_ats_llm"] = {
+                **(st.session_state.get("final_ats_llm") or {}),
+                "score": score,
+                "present": present,
+                "missing": missing,
+                "coverage": coverage,
+            }
 
-                    def _has_seq(text_tokens, term_tokens):
-                        """Exact token-sequence match, case-insensitive, punctuation-insensitive."""
-                        if not term_tokens:
-                            return False, -1
-                        L = len(term_tokens)
-                        for i in range(0, len(text_tokens) - L + 1):
-                            if text_tokens[i:i+L] == term_tokens:
-                                return True, i
-                        return False, -1
-
-                    def _evidence_span(raw_text: str, start_idx_tokens: int, term_len_tokens: int):
-                        """Return a short evidence snippet around the match (best-effort)."""
-                        # naive snippet: just return the matched token sequence reconstructed from text
-                        # Re-tokenize with spans to get character positions
-                        spans = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-z0-9#+.]+", raw_text)]
-                        if 0 <= start_idx_tokens < len(spans):
-                            s = spans[start_idx_tokens][1]
-                            e_idx = min(start_idx_tokens + term_len_tokens - 1, len(spans) - 1)
-                            e = spans[e_idx][2]
-                            # pad a few chars around
-                            s = max(0, s - 20)
-                            e = min(len(raw_text), e + 20)
-                            return raw_text[s:e].replace("\n", " ").strip()
-                        return ""
-
-                    # Ordered keywords list: ranked + gaps (deduped)
-                    ranked = []
-                    for item in (kw_obj.get("keywords") or []):
-                        term = (item.get("term") or "").strip()
-                        if term:
-                            ranked.append(term)
-                    gaps = list(kw_obj.get("missing") or [])
-
-                    seen_terms = set()
-                    ordered_terms = []
-                    for t in (ranked + gaps):
-                        c = _canon(t)
-                        if c and c not in seen_terms:
-                            seen_terms.add(c)
-                            ordered_terms.append(t)
-
-                    # Variants map from optimizer
-                    variants_map = {}
-                    for item in (kw_obj.get("keywords") or []):
-                        term = (item.get("term") or "").strip()
-                        if term:
-                            variants_map[_canon(term)] = [v.strip() for v in (item.get("variants") or []) if v and v.strip()]
-
-                    # Tokenize final resume once
-                    final_tokens = [t.lower() for t in token_re.findall(final_text)]
-
-                    present, missing, coverage = [], [], []
-                    for term in ordered_terms:
-                        # Candidate list: the term + its declared variants
-                        term_canon = _canon(term)
-                        cand_list = [term]
-                        if term_canon in variants_map:
-                            cand_list.extend([v for v in variants_map[term_canon] if v])
-
-                        found = False
-                        found_pos = -1
-                        found_len = 0
-
-                        for cand in cand_list:
-                            tt = [t.lower() for t in token_re.findall(cand or "")]
-                            ok, pos = _has_seq(final_tokens, tt)
-                            if ok:
-                                found = True
-                                found_pos = pos
-                                found_len = len(tt)
-                                break
-
-                        if found:
-                            present.append(term)
-                            ev = _evidence_span(final_text, found_pos, found_len)
-                            coverage.append({"term": term, "present": True, "evidence": ev})
-                        else:
-                            missing.append(term)
-                            coverage.append({"term": term, "present": False, "evidence": ""})
-
-                    # Override the LLM's result with deterministic coverage
-                    total = max(1, len(ordered_terms))
-                    score = round(100 * len(present) / total)
-                    st.session_state["final_ats_llm"] = {
-                        **(st.session_state.get("final_ats_llm") or {}),
-                        "score": score,
-                        "present": present,
-                        "missing": missing,
-                        "coverage": coverage,
-                        # Keep suggestions from LLM if any
-                        "suggestions": (st.session_state.get("final_ats_llm") or {}).get("suggestions", [])
-                    }
-                    # --- end reconciliation ---
-
-
-            else:
-                # Local rule-based ATS vs JD (kept as optional fallback)
-                final_ats = analyze(final_text, jd_text)
-                st.session_state["final_ats_report"] = final_ats
-                st.session_state["final_ats_llm"] = None
-
-    # Display results
+    # Display ATS results
     ats_llm = st.session_state.get("final_ats_llm")
-    final_ats = st.session_state.get("final_ats_report")
-
-    if use_ai_ats and ats_llm:
+    if ats_llm:
         c1, c2 = st.columns([1, 2])
         with c1:
-            st.metric("AI ATS Keyword Score", f"{ats_llm.get('score', 0)}%")
+            st.metric("AI ATS Keyword Score", f"{ats_llm.get('score',0)}%")
         with c2:
-            st.write("Suggestions:")
-            for s in (ats_llm.get("suggestions") or []):
-                st.write(f"• {s}")
+            st.write("Suggestions (where & how to add missing keywords):")
+            sugg = ats_llm.get("suggestions") or []
+            miss = set(ats_llm.get("missing") or [])
+            shown = False
+            for s in sugg:
+                term = s.get("term","")
+                if term in miss:
+                    shown = True
+                    st.write(f"• {term} → {s.get('section','Core Competencies')}: {s.get('how','')}")
+            if not shown:
+                st.write("—")
 
         colp, colm = st.columns(2)
         with colp:
@@ -512,30 +471,14 @@ if resume_text.strip() and jd_text.strip():
         cov = ats_llm.get("coverage") or []
         if cov:
             st.markdown("**Coverage details (sample)**")
-            for row in cov[:10]:
-                t = row.get("term", "")
-                p = "✅" if row.get("present") else "❌"
-                ev = row.get("evidence", "")
+            for row in cov[:12]:
+                t = row.get("term",""); p = "✅" if row.get("present") else "❌"
+                ev = row.get("evidence","")
                 st.write(f"{p} {t}: {ev}")
 
-    elif (not use_ai_ats) and final_ats:
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            st.metric("Match Score (final)", f"{final_ats['match']['match_score']}%")
-        with c2:
-            st.metric("Readability (FRE)", final_ats["readability"]["flesch_reading_ease"])
-        with c3:
-            st.write("ATS warnings:")
-            for w in final_ats["ats"]["warnings"]:
-                st.write(f"• {w}")
-        try:
-            missing = [w for (w, _) in (final_ats["keywords_bow"]["missing"] or [])]
-        except Exception:
-            missing = []
-        st.write("Top missing keywords:", ", ".join(missing[:20]) if missing else "—")
-
-
-
+    # -----------------
+    # Export (Saved text only)
+    # -----------------
     colx1, colx2 = st.columns(2)
     with colx1:
         saved_text = (st.session_state.get("tailored_text", "") or "").strip()
@@ -545,7 +488,6 @@ if resume_text.strip() and jd_text.strip():
                 st.download_button("Download DOCX", f, file_name="tailored_resume.docx")
         elif not st.session_state.get("tailored_saved"):
             st.info("Edit the text and click Save before exporting DOCX.")
-
     with colx2:
         saved_text = (st.session_state.get("tailored_text", "") or "").strip()
         if st.session_state.get("tailored_saved") and saved_text and st.button("⬇️ Export PDF (professional)"):

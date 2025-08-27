@@ -3,14 +3,13 @@ from typing import Dict, Any, Optional, List
 import re, json
 from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
-
 from ai.prompts import (
-    SYSTEM_TAILOR, USER_TAILOR, 
-    SYSTEM_KEYWORDS, USER_KEYWORDS, 
+    SYSTEM_TAILOR, USER_TAILOR,
+    SYSTEM_KEYWORDS, USER_KEYWORDS,
     SYSTEM_SAMPLE_RESUME, USER_SAMPLE_RESUME,
     SYSTEM_TAILOR_JSON, USER_TAILOR_JSON,
     SYSTEM_CONTACTS, USER_CONTACTS,
-    SYSTEM_ATS, USER_ATS
+    SYSTEM_ATS, USER_ATS,  # <-- ATS prompts
 )
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -23,11 +22,10 @@ def extract_contacts_regex(text: str) -> Dict[str,str]:
     phone = PHONE_RE.search(text)
     linkedin = LINKEDIN_RE.search(text)
     github = GITHUB_RE.search(text)
-    # naive name: first simple text line
     name = ""
-    for i, line in enumerate(text.splitlines()[:15]):
+    for line in text.splitlines()[:15]:
         s = line.strip()
-        if not s or len(s) > 60: 
+        if not s or len(s) > 60:
             continue
         if any(ch.isdigit() for ch in s) or any(x in s for x in ("@", "http", "|", "/", "\\", "•", " - ", ",", "(", ")", ":" )):
             continue
@@ -44,7 +42,6 @@ def extract_contacts_regex(text: str) -> Dict[str,str]:
     }
 
 def sanitize_markdown(md: str) -> str:
-    # We output plain text, but still clean stray markers & spacing
     md = md.replace("**", "")
     md = md.replace("\t", " ")
     md = re.sub(r"[ ]{3,}", "  ", md)
@@ -52,7 +49,7 @@ def sanitize_markdown(md: str) -> str:
     return md.strip()
 
 def readability(text: str) -> Dict[str, float]:
-    sentences = max(1, len(re.findall(r"[.!?]+", text)) )
+    sentences = max(1, len(re.findall(r"[.!?]+", text)))
     words = re.findall(r"[A-Za-z0-9']+", text)
     words_count = max(1, len(words))
     fre = 206.835 - 1.015*(words_count/sentences) - 84.6*(1/words_count)
@@ -86,7 +83,7 @@ def _provider_from_keys(provider_preference: Optional[str], keys: Dict[str,str])
 def extract_contacts_llm(resume_text: str, provider_pref: Optional[str], model_name: Optional[str], keys: Dict[str,str]) -> Dict[str,str]:
     provider = _provider_from_keys(provider_pref, keys)
     raw = provider.chat(model=model_name, system=SYSTEM_CONTACTS, user=USER_CONTACTS.format(resume=resume_text), temperature=0, max_tokens=256)
-    raw = raw.strip().strip('`').strip()
+    raw = (raw or "").strip().strip('`').strip()
     try:
         start = raw.find('{'); end = raw.rfind('}') + 1
         obj = json.loads(raw[start:end])
@@ -94,99 +91,17 @@ def extract_contacts_llm(resume_text: str, provider_pref: Optional[str], model_n
         return out
     except Exception:
         return extract_contacts_regex(resume_text)
+
 def extract_keywords_llm(resume_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
     raw = provider.chat(model=model_name, system=SYSTEM_KEYWORDS, user=USER_KEYWORDS.format(jd=jd_text, resume=resume_text), temperature=temperature, max_tokens=max_tokens)
-    raw = raw.strip().strip('`').strip()
+    raw = (raw or "").strip().strip('`').strip()
     try:
         start = raw.find('{'); end = raw.rfind('}') + 1
         obj = json.loads(raw[start:end])
     except Exception:
         obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
     return obj
-
-
-# def extract_ats_llm(resume_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
-#     """
-#     AI-powered ATS evaluator. Returns a dict matching SYSTEM_ATS schema.
-#     """
-#     provider = _provider_from_keys(provider_pref, keys)
-#     raw = provider.chat(
-#         model=model_name,
-#         system=SYSTEM_ATS,
-#         user=USER_ATS.format(jd=jd_text, resume=resume_text),
-#         temperature=0,                                  # deterministic scoring
-#         max_tokens=min(max_tokens, 800)
-#     )
-#     raw = (raw or "").strip().strip('`').strip()
-#     try:
-#         start = raw.find('{'); end = raw.rfind('}') + 1
-#         obj = json.loads(raw[start:end])
-#         # basic normalization
-#         obj["score"] = int(max(0, min(100, int(obj.get("score", 0)))))
-#         for k in ["strengths","gaps","missing_keywords","suggestions"]:
-#             if not isinstance(obj.get(k), list): obj[k] = []
-#         if not isinstance(obj.get("section_feedback"), dict):
-#             obj["section_feedback"] = {"summary":[], "experience":[], "skills":[], "education":[]}
-#         return obj
-#     except Exception:
-#         # safe fallback
-#         return {
-#             "score": 0, "strengths": [], "gaps": [],
-#             "missing_keywords": [], "suggestions": [],
-#             "section_feedback": {"summary":[], "experience":[], "skills":[], "education":[]}
-#         }
-
-def extract_ats_llm(
-    resume_text: str,
-    keywords: list[str],
-    provider_pref: Optional[str],
-    model_name: Optional[str],
-    temperature: float,
-    max_tokens: int,
-    keys: Dict[str,str]
-) -> Dict[str, Any]:
-    """
-    AI-powered ATS keyword coverage evaluator.
-    Compares TARGET KEYWORDS (from LLM Keyword Optimizer) against the FINAL resume text.
-    """
-    provider = _provider_from_keys(provider_pref, keys)
-
-    # Make a clean, unique list
-    token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    def _canon(s: str) -> str:
-        return " ".join(t.lower() for t in token_re.findall(s or ""))
-
-    seen = set(); clean_keywords = []
-    for k in (keywords or []):
-        c = _canon(k)
-        if c and c not in seen:
-            seen.add(c)
-            clean_keywords.append(k.strip())
-
-    kw_blob = "\n".join(f"- {k}" for k in clean_keywords)
-
-    raw = provider.chat(
-        model=model_name,
-        system=SYSTEM_ATS,
-        user=USER_ATS.format(resume=resume_text, keywords=kw_blob),
-        temperature=0,                                  # deterministic
-        max_tokens=min(max_tokens, 900)
-    )
-    raw = (raw or "").strip().strip('`').strip()
-    try:
-        start = raw.find('{'); end = raw.rfind('}') + 1
-        obj = json.loads(raw[start:end])
-        # normalize
-        obj["score"] = int(max(0, min(100, int(obj.get("score", 0)))))
-        for arr_key in ["present","missing","suggestions"]:
-            if not isinstance(obj.get(arr_key), list): obj[arr_key] = []
-        if not isinstance(obj.get("coverage"), list): obj["coverage"] = []
-        return obj
-    except Exception:
-        return {"score": 0, "present": [], "missing": clean_keywords, "coverage": [], "suggestions": []}
-
-
 
 def _limit_words(s: str, max_words: int = 22) -> str:
     parts = s.split()
@@ -283,37 +198,7 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
 
 def tailor(resume_text: str, jd_text: str, provider_preference: str = None, model_name: str = None, temperature: float = 0.2, max_tokens: int = 1500, keys: Dict[str,str] = None, target_keywords: Optional[List[str]] = None, override_contacts: Optional[Dict[str,str]] = None) -> str:
     provider = _provider_from_keys(provider_preference, keys or {})
-
-    # SAME tokenizer as extractor
-    token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    def _canon(s: str) -> str:
-        return " ".join(t.lower() for t in token_re.findall(s or ""))
-
-    def _has_term(text: str, term: str) -> bool:
-        tt = token_re.findall((text or "").lower())
-        kt = token_re.findall((term or "").lower())
-        if not kt:
-            return False
-        L = len(kt)
-        for i in range(0, len(tt) - L + 1):
-            if tt[i:i+L] == kt:
-                return True
-        return False
-
-    # 1) Deduplicate incoming keywords (ranked + gaps) using same tokenizer
-    seen = set()
-    deduped = []
-    for k in (target_keywords or []):
-        c = _canon(k)
-        if c and c not in seen:
-            seen.add(c)
-            deduped.append(k)
-
-    # 2) FILTER OUT keywords already present in the ORIGINAL resume (A ∩ B)
-    allowed = [k for k in deduped if not _has_term(resume_text, k)]
-
-    kw_blob = "\n".join(f"- {k}" for k in allowed)
-
+    kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
     contacts = override_contacts if override_contacts is not None else extract_contacts_regex(resume_text)
     contact_block = f"""name={contacts.get('name','')}
 email={contacts.get('email','')}
@@ -321,7 +206,6 @@ phone={contacts.get('phone','')}
 linkedin={contacts.get('linkedin','')}
 github={contacts.get('github','')}"""
 
-    # ---- Try structured JSON path first
     raw = provider.chat(
         model=model_name,
         system=SYSTEM_TAILOR_JSON,
@@ -330,70 +214,79 @@ github={contacts.get('github','')}"""
         max_tokens=max_tokens
     ).strip()
 
-    txt = ""
     try:
         start = raw.find("{"); end = raw.rfind("}") + 1
         obj = json.loads(raw[start:end])
         txt = render_text_from_json(obj)
+        if txt: return txt
     except Exception:
         pass
 
-    if not txt:
-        out = provider.chat(
-            model=model_name,
-            system=SYSTEM_TAILOR,
-            user=USER_TAILOR.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        txt = sanitize_markdown(out)
+    out = provider.chat(model=model_name, system=SYSTEM_TAILOR, user=USER_TAILOR.format(jd=jd_text, resume=resume_text, keywords=kw_blob), temperature=temperature, max_tokens=max_tokens)
+    return sanitize_markdown(out)
 
-    # 3) GUARANTEE COVERAGE: ensure every 'allowed' keyword appears at least once
-    missing_terms = [k for k in allowed if not _has_term(txt, k)]
-    if missing_terms:
-        lines = txt.splitlines()
+# -----------------------------
+# AI ATS: read final resume + optimizer JSON, return strict JSON
+# -----------------------------
+def extract_ats_llm_from_optimizer(
+    resume_text: str,
+    optimizer_obj: Dict[str, Any],
+    provider_pref: Optional[str],
+    model_name: Optional[str],
+    temperature: float,
+    max_tokens: int,
+    keys: Dict[str, str],
+    jd_text: Optional[str] = ""
+) -> Dict[str, Any]:
+    provider = _provider_from_keys(provider_pref, keys)
 
-        # Find "Core Competencies" section; else we'll create it before Technical Skills / Work Experience / end
-        comp_idx = None
-        for idx, ln in enumerate(lines):
-            if ln.strip() == "Core Competencies":
-                comp_idx = idx
-                break
+    # compact optimizer JSON to essentials (term + variants + rank + missing/weak/summary)
+    kws = []
+    for item in (optimizer_obj.get("keywords") or []):
+        term = (item.get("term") or "").strip()
+        if term:
+            kws.append({
+                "rank": item.get("rank", None),
+                "term": term,
+                "variants": [v for v in (item.get("variants") or []) if v]
+            })
+    payload = {
+        "keywords": kws,
+        "missing": optimizer_obj.get("missing") or [],
+        "weak": optimizer_obj.get("weak") or [],
+        "summary": optimizer_obj.get("summary") or ""
+    }
+    optimizer_json = json.dumps(payload, ensure_ascii=False)
 
-        # Build one-liner bullets for missing terms
-        bullets = [f"• {k}: role-aligned capability as required by the job description." for k in missing_terms]
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_ATS,
+        user=USER_ATS.format(resume=resume_text, optimizer_json=optimizer_json, jd=(jd_text or "")),
+        temperature=0,
+        max_tokens=min(max_tokens, 1200)
+    )
+    raw = (raw or "").strip().strip('`').strip()
+    try:
+        start = raw.find('{'); end = raw.rfind('}') + 1
+        obj = json.loads(raw[start:end])
+    except Exception:
+        obj = {}
 
-        if comp_idx is not None:
-            # Insert bullets right after the "Core Competencies" heading, keeping spacing tidy
-            insert_at = comp_idx + 1
-            # Ensure one blank line after heading if needed
-            if insert_at >= len(lines) or (lines[insert_at].strip() and not lines[insert_at].startswith("• ")):
-                lines.insert(insert_at, "")
-                insert_at += 1
-            for b in bullets:
-                lines.insert(insert_at, b)
-                insert_at += 1
-            # Add a trailing blank line if next line is non-blank and not a bullet
-            if insert_at < len(lines) and lines[insert_at].strip() and not lines[insert_at].startswith("• "):
-                lines.insert(insert_at, "")
-        else:
-            # Create section near the top (before common anchors) or at end
-            anchors = {"Technical Skills","Work Experience","Education","Certifications","Projects"}
-            anchor_idx = None
-            for idx, ln in enumerate(lines):
-                if ln.strip() in anchors:
-                    anchor_idx = idx
-                    break
-            block = ["Core Competencies", *bullets, ""]
-            if anchor_idx is not None:
-                lines[anchor_idx:anchor_idx] = block
-            else:
-                if lines and lines[-1].strip():
-                    lines.append("")  # ensure spacing
-                lines.extend(block)
-
-        txt = sanitize_markdown("\n".join(lines))
-
-    return txt
-    
-    
+    # normalize
+    try:
+        obj["score"] = int(max(0, min(100, int(obj.get("score", 0)))))
+    except Exception:
+        obj["score"] = 0
+    for k in ["present", "missing", "suggestions", "coverage"]:
+        if not isinstance(obj.get(k), list):
+            obj[k] = []
+    fixed_sugg = []
+    for s in obj.get("suggestions", []):
+        if isinstance(s, dict):
+            fixed_sugg.append({
+                "term": s.get("term", ""),
+                "section": s.get("section", "Core Competencies"),
+                "how": s.get("how", "")
+            })
+    obj["suggestions"] = fixed_sugg
+    return obj
