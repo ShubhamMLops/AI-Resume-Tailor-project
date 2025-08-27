@@ -58,6 +58,10 @@ with col2:
     st.subheader("Job Description")
     jd_text = read_textarea_or_file("Job Description", "jd_text", "jd_file")
 
+# (1) Always use the visible paste boxes as the source of truth for AI steps
+resume_text = st.session_state.get("resume_text", "") or resume_text
+jd_text = st.session_state.get("jd_text", "") or jd_text
+
 if resume_text.strip() and jd_text.strip():
     st.divider()
     st.subheader("Analysis")
@@ -238,24 +242,49 @@ if resume_text.strip() and jd_text.strip():
             tailored = tailor(resume_text, jd_text, provider_preference=provider, model_name=(model or None),
                               temperature=temperature, max_tokens=max_tokens, keys=keys,
                               target_keywords=target, override_contacts=override_contacts)
-            st.session_state["tailored_text"] = sanitize_markdown(tailored)
-            st.success("Tailored resume generated.")
+
+            # Update stored + editor text; require Save for export
+            final_txt = sanitize_markdown(tailored)
+            st.session_state["tailored_text"] = final_txt
+            if "tailored_edit" not in st.session_state or not st.session_state["tailored_edit"]:
+                st.session_state["tailored_edit"] = final_txt
+            else:
+                # refresh editor with new generation (so users can edit immediately)
+                st.session_state["tailored_edit"] = final_txt
+            st.session_state["tailored_saved"] = False
+
+            st.success("Tailored resume generated. Review and click Save before exporting.")
         except Exception as e:
             st.error(str(e))
 
-    tailored_text = st.session_state.get("tailored_text", "")
-    st.text_area("Tailored resume (plain text)", value=tailored_text, height=420)
+    # (2) Editable tailored text area + Save button; exports use saved text
+    if "tailored_edit" not in st.session_state:
+        st.session_state["tailored_edit"] = st.session_state.get("tailored_text", "")
+
+    edited_text = st.text_area("Tailored resume (plain text)", key="tailored_edit", height=420)
+
+    if st.button("💾 Save"):
+        st.session_state["tailored_text"] = (edited_text or "").strip()
+        st.session_state["tailored_saved"] = True
+        st.success("Saved. Exports will use your edited text.")
 
     colx1, colx2 = st.columns(2)
     with colx1:
-        if tailored_text and st.button("⬇️ Export DOCX"):
-            out_path = export_docx(tailored_text, "tailored_resume.docx")
+        saved_text = (st.session_state.get("tailored_text", "") or "").strip()
+        if st.session_state.get("tailored_saved") and saved_text and st.button("⬇️ Export DOCX"):
+            out_path = export_docx(saved_text, "tailored_resume.docx")
             with open(out_path, "rb") as f:
                 st.download_button("Download DOCX", f, file_name="tailored_resume.docx")
+        elif not st.session_state.get("tailored_saved"):
+            st.info("Edit the text and click Save before exporting DOCX.")
+
     with colx2:
-        if tailored_text and st.button("⬇️ Export PDF (professional)"):
-            out_path = export_pdf(tailored_text, "tailored_resume.pdf")
+        saved_text = (st.session_state.get("tailored_text", "") or "").strip()
+        if st.session_state.get("tailored_saved") and saved_text and st.button("⬇️ Export PDF (professional)"):
+            out_path = export_pdf(saved_text, "tailored_resume.pdf")
             with open(out_path, "rb") as f:
                 st.download_button("Download PDF", f, file_name="tailored_resume.pdf")
+        elif not st.session_state.get("tailored_saved"):
+            st.info("Edit the text and click Save before exporting PDF.")
 else:
     st.info("Upload or paste both the Resume and the Job Description to begin.")
