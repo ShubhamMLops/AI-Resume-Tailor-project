@@ -317,24 +317,27 @@ if resume_text.strip() and jd_text.strip():
                     st.info("No sentences were generated.")
 
     # -----------------
-    # Tailor with LLM (Top Keywords (ranked) + Gaps) — no duplication
+    # Tailor with LLM (Integrated with Keyword Sentence Generator) — no duplicates
     # -----------------
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    st.caption("Uses ONLY Top Keywords (ranked) + Gaps from the LLM Keyword Optimizer; removes those already present in the resume.")
+    st.caption("Uses ONLY Top Keywords (ranked) + Gaps from the LLM Keyword Optimizer; tailors first, then fills ONLY still-missing terms with ATS-friendly bullets (no duplicates).")
 
     # Enable only if the optimizer has Top Keywords (ranked) or Gaps
     can_generate = bool(st.session_state.get("kw_llm", {}).get("keywords") or st.session_state.get("kw_llm", {}).get("missing"))
     if st.button("Generate tailored resume", type="primary", disabled=not can_generate):
         try:
             target = []
-            kw_obj = st.session_state.get("kw_llm")  # ensure we read the latest
-            if kw_obj:
-                # Build target keywords from Top Keywords (ranked) + Gaps, deduped,
-                # and excluding anything already present in the original resume
-                target = build_target_keywords_from_optimizer(kw_obj, resume_text, jd_text)
+            kw_obj_now = st.session_state.get("kw_llm")  # latest optimizer output
+
+            if kw_obj_now:
+                # Step 1: Build target keywords from Top Keywords (ranked) + Gaps,
+                #         deduped & excluding anything already present in the ORIGINAL resume
+                target = build_target_keywords_from_optimizer(kw_obj_now, resume_text, jd_text)
 
             override_contacts = st.session_state.get("override_contacts")
+
+            # Step 2: Tailor with ONLY the filtered target keywords
             tailored = tailor(
                 resume_text,
                 jd_text,
@@ -343,17 +346,103 @@ if resume_text.strip() and jd_text.strip():
                 temperature=temperature,
                 max_tokens=max_tokens,
                 keys=keys,
-                target_keywords=target,  # <-- ONLY Top Keywords (ranked) + Gaps (filtered)
+                target_keywords=target,
                 override_contacts=override_contacts
             )
+            tailored_txt = sanitize_markdown(tailored)
 
-            final_txt = sanitize_markdown(tailored)
-            st.session_state["tailored_text"] = final_txt
-            st.session_state["tailored_edit"] = final_txt
+            # Step 3: Determine which optimizer keywords are STILL missing in the tailored text
+            token_re = re.compile(r"[A-Za-z0-9#+.]+")
+            def _canon(s: str) -> str:
+                return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+            def _tok_seq(s: str):
+                return [t.lower() for t in token_re.findall(s or "")]
+
+            # Build ordered list: Top Keywords (ranked) + Gaps (deduped)
+            ranked = [(it.get("term") or "").strip() for it in (kw_obj_now.get("keywords") or []) if (it.get("term") or "").strip()]
+            gaps   = list(kw_obj_now.get("missing") or [])
+            seen_terms, ordered_terms = set(), []
+            for t in (ranked + gaps):
+                c = _canon(t)
+                if c and c not in seen_terms:
+                    seen_terms.add(c); ordered_terms.append(t)
+
+            # Variants map from optimizer
+            variants_map = {}
+            for it in (kw_obj_now.get("keywords") or []):
+                base = (it.get("term") or "").strip()
+                if base:
+                    variants_map[_canon(base)] = [v.strip() for v in (it.get("variants") or []) if v and v.strip()]
+
+            # Tokenize tailored text & compact form for CI/CD-like cases
+            t_tokens   = [t.lower() for t in token_re.findall(tailored_txt)]
+            t_compact  = "".join(t_tokens)
+
+            def _present_in_tailored(term: str) -> bool:
+                cand_list = [term] + (variants_map.get(_canon(term), []))
+                for cand in cand_list:
+                    kt = _tok_seq(cand)
+                    if not kt:
+                        continue
+                    L = len(kt)
+
+                    # A) exact token sequence
+                    for i in range(0, len(t_tokens) - L + 1):
+                        if t_tokens[i:i+L] == kt:
+                            return True
+
+                    # B) compacted (CI/CD -> cicd)
+                    k_comp = "".join(kt)
+                    if k_comp and k_comp in t_compact:
+                        return True
+
+                    # C) simple plural/singular toggle for single-token words (avoid short acronyms)
+                    if L == 1 and len(kt[0]) > 3:
+                        base = kt[0]
+                        alt = base[:-1] if base.endswith("s") else base + "s"
+                        if base in t_tokens or alt in t_tokens:
+                            return True
+                return False
+
+            missing_after_tailor = [term for term in ordered_terms if not _present_in_tailored(term)]
+
+            # Step 4: If anything is still missing, generate ATS-friendly bullets ONLY for those missing terms
+            appended_block = ""
+            if missing_after_tailor:
+                bullets = generate_keyword_sentences(
+                    resume_text=resume_text,       # read full resume for context; do NOT invent
+                    jd_text=jd_text,
+                    target_keywords=missing_after_tailor,
+                    provider_pref=provider,
+                    model_name=(model or None),
+                    temperature=temperature,
+                    max_tokens=min(max_tokens, 900),
+                    keys=keys
+                )
+                if bullets and bullets.strip():
+                    appended_block = "\n".join([
+                        "",
+                        "Core Competencies",  # neutral/safe section for unevidenced-but-required terms
+                        bullets.strip(),
+                        ""
+                    ])
+
+            # Step 5: Combine tailored text + optional bullets, load into editor (unsaved)
+            final_txt = (tailored_txt + appended_block).strip()
+            st.session_state["tailored_text"]  = final_txt
+            st.session_state["tailored_edit"]  = final_txt
             st.session_state["tailored_saved"] = False
-            st.success("Tailored resume generated from Top Keywords (ranked) + Gaps. Review and click Save before exporting.")
+
+            # UX feedback
+            if missing_after_tailor and appended_block:
+                st.success(f"Tailored resume generated. Added ATS-friendly bullets for {len(missing_after_tailor)} still-missing keywords. Review, then click Save before exporting.")
+            else:
+                st.success("Tailored resume generated. All optimizer keywords are covered. Review, then click Save before exporting.")
+
         except Exception as e:
             st.error(str(e))
+
 
     # Editor + Save
     if "tailored_edit" not in st.session_state:
