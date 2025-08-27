@@ -267,6 +267,38 @@ if resume_text.strip() and jd_text.strip():
         st.session_state["tailored_text"] = (edited_text or "").strip()
         st.session_state["tailored_saved"] = True
         st.success("Saved. Exports will use your edited text.")
+        # --- NEW: ATS Scan on the edited (final) resume text ---
+    st.divider()
+    st.subheader("ATS Scan (Final Resume vs JD)")
+
+    if st.button("Run ATS analysis on edited resume"):
+        final_text = (st.session_state.get("tailored_edit", "") or "").strip()
+        if not final_text:
+            st.warning("Please add or generate resume content first.")
+        else:
+            final_ats = analyze(final_text, jd_text)  # uses JD paste box already
+            st.session_state["final_ats_report"] = final_ats
+
+    final_ats = st.session_state.get("final_ats_report")
+    if final_ats:
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            st.metric("Match Score (final)", f"{final_ats['match']['match_score']}%")
+        with c2:
+            st.metric("Readability (FRE)", final_ats["readability"]["flesch_reading_ease"])
+        with c3:
+            st.write("ATS warnings:")
+            for w in final_ats["ats"]["warnings"]:
+                st.write(f"• {w}")
+
+        # Show keyword gaps vs JD (bag-of-words)
+        try:
+            missing = [w for (w, _) in (final_ats["keywords_bow"]["missing"] or [])]
+        except Exception:
+            missing = []
+        st.write("Top missing keywords:", ", ".join(missing[:20]) if missing else "—")
+    # --- END NEW ---
+
 
     colx1, colx2 = st.columns(2)
     with colx1:
