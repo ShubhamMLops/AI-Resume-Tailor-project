@@ -376,6 +376,109 @@ if resume_text.strip() and jd_text.strip():
                     )
                     st.session_state["final_ats_llm"] = ats_llm
                     st.session_state["final_ats_report"] = None  # clear rule-based
+                    # --- Reconcile LLM ATS with local robust matching (fix false 'missing') ---
+                    final_text = (st.session_state.get("tailored_edit", "") or "").strip()
+                    kw_obj = st.session_state.get("kw_llm") or {}
+
+                    # Build a mapping term -> variants (from Optimizer), keep order of terms we sent
+                    token_re = re.compile(r"[A-Za-z0-9#+.]+")
+                    def _canon(s: str) -> str:
+                        return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+                    def _has_seq(text_tokens, term_tokens):
+                        """Exact token-sequence match, case-insensitive, punctuation-insensitive."""
+                        if not term_tokens:
+                            return False, -1
+                        L = len(term_tokens)
+                        for i in range(0, len(text_tokens) - L + 1):
+                            if text_tokens[i:i+L] == term_tokens:
+                                return True, i
+                        return False, -1
+
+                    def _evidence_span(raw_text: str, start_idx_tokens: int, term_len_tokens: int):
+                        """Return a short evidence snippet around the match (best-effort)."""
+                        # naive snippet: just return the matched token sequence reconstructed from text
+                        # Re-tokenize with spans to get character positions
+                        spans = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-z0-9#+.]+", raw_text)]
+                        if 0 <= start_idx_tokens < len(spans):
+                            s = spans[start_idx_tokens][1]
+                            e_idx = min(start_idx_tokens + term_len_tokens - 1, len(spans) - 1)
+                            e = spans[e_idx][2]
+                            # pad a few chars around
+                            s = max(0, s - 20)
+                            e = min(len(raw_text), e + 20)
+                            return raw_text[s:e].replace("\n", " ").strip()
+                        return ""
+
+                    # Ordered keywords list: ranked + gaps (deduped)
+                    ranked = []
+                    for item in (kw_obj.get("keywords") or []):
+                        term = (item.get("term") or "").strip()
+                        if term:
+                            ranked.append(term)
+                    gaps = list(kw_obj.get("missing") or [])
+
+                    seen_terms = set()
+                    ordered_terms = []
+                    for t in (ranked + gaps):
+                        c = _canon(t)
+                        if c and c not in seen_terms:
+                            seen_terms.add(c)
+                            ordered_terms.append(t)
+
+                    # Variants map from optimizer
+                    variants_map = {}
+                    for item in (kw_obj.get("keywords") or []):
+                        term = (item.get("term") or "").strip()
+                        if term:
+                            variants_map[_canon(term)] = [v.strip() for v in (item.get("variants") or []) if v and v.strip()]
+
+                    # Tokenize final resume once
+                    final_tokens = [t.lower() for t in token_re.findall(final_text)]
+
+                    present, missing, coverage = [], [], []
+                    for term in ordered_terms:
+                        # Candidate list: the term + its declared variants
+                        term_canon = _canon(term)
+                        cand_list = [term]
+                        if term_canon in variants_map:
+                            cand_list.extend([v for v in variants_map[term_canon] if v])
+
+                        found = False
+                        found_pos = -1
+                        found_len = 0
+
+                        for cand in cand_list:
+                            tt = [t.lower() for t in token_re.findall(cand or "")]
+                            ok, pos = _has_seq(final_tokens, tt)
+                            if ok:
+                                found = True
+                                found_pos = pos
+                                found_len = len(tt)
+                                break
+
+                        if found:
+                            present.append(term)
+                            ev = _evidence_span(final_text, found_pos, found_len)
+                            coverage.append({"term": term, "present": True, "evidence": ev})
+                        else:
+                            missing.append(term)
+                            coverage.append({"term": term, "present": False, "evidence": ""})
+
+                    # Override the LLM's result with deterministic coverage
+                    total = max(1, len(ordered_terms))
+                    score = round(100 * len(present) / total)
+                    st.session_state["final_ats_llm"] = {
+                        **(st.session_state.get("final_ats_llm") or {}),
+                        "score": score,
+                        "present": present,
+                        "missing": missing,
+                        "coverage": coverage,
+                        # Keep suggestions from LLM if any
+                        "suggestions": (st.session_state.get("final_ats_llm") or {}).get("suggestions", [])
+                    }
+                    # --- end reconciliation ---
+
 
             else:
                 # Local rule-based ATS vs JD (kept as optional fallback)
