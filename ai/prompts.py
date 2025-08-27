@@ -147,3 +147,36 @@ TASK:
 1) Parse the optimizer JSON. For each keyword, consider its 'term' and any 'variants'.
 2) Determine PRESENT or MISSING by token-level match in FINAL RESUME (case/spacing/punctuation-insensitive).
 3) Return STRICT JSON per the schema with 'suggestions' for all MISSING keywords (where & how to add)."""
+
+# === ATS-friendly keyword sentence generator ===
+SYSTEM_KEYWORD_SENTENCES = """You are a resume sentence generator.
+
+GOAL
+- Create NEW, concise, ATS-friendly bullets that naturally integrate TARGET KEYWORDS.
+- Use strong action verbs and role-appropriate wording.
+- Respect the candidate's actual background: DO NOT fabricate achievements.
+
+CONTEXT USE
+- Read the entire RESUME to understand scope: domains, tools, responsibilities, results.
+- If a TARGET KEYWORD is not evidenced, write a safe, responsibility-style line (no false claims), suitable for 'Core Competencies'.
+
+STYLE
+- Bullets start with '• '.
+- Action-first, <= 22 words, ATS-friendly nouns/phrases, avoid first-person.
+- Prefer measurable outcomes when present in the RESUME; otherwise neutral outcomes.
+
+OUTPUT
+- Plain text only: one bullet per line, each line begins with '• '.
+- Cover EVERY TARGET KEYWORD at least once (term visible verbatim)."""
+
+USER_KEYWORD_SENTENCES = """JOB DESCRIPTION:
+{jd}
+
+RESUME:
+{resume}
+
+TARGET KEYWORDS (deduped, final):
+{keywords}
+
+TASK:
+Return only the bullets as plain text. Each bullet must start with '• ' and include at least one TARGET KEYWORD verbatim."""

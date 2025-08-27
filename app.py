@@ -8,6 +8,7 @@ from pipeline import (
     extract_contacts_llm,
     sanitize_markdown,
     extract_ats_llm_from_optimizer,  # AI ATS helper
+    generate_keyword_sentences
 )
 
 st.set_page_config(page_title="API-only Resume Tailor (v8 final)", page_icon="🧰", layout="wide")
@@ -273,6 +274,47 @@ if resume_text.strip() and jd_text.strip():
                 if not weak or not isinstance(weak, list): weak = fallback_weak
             st.write("Missing:", ", ".join(missing) if missing else "—")
             st.write("Weak:", ", ".join(weak) if weak else "—")
+    # -----------------
+    # Generate ATS-friendly keyword sentences (from Top Keywords (ranked) + Gaps)
+    # -----------------
+    st.subheader("Keyword Sentence Generator (ATS-friendly)")
+    st.caption("Reads your resume context and creates concise bullets that naturally integrate Top Keywords (ranked) + Gaps.")
+
+    if st.button("Generate ATS-friendly keyword sentences"):
+        kw_obj_now = st.session_state.get("kw_llm")
+        if not kw_obj_now:
+            st.warning("Please run the LLM Keyword Optimizer first.")
+        else:
+            # Build final target list (variants-aware, deduped, skip already-present)
+            target_for_sentences = build_target_keywords_from_optimizer(kw_obj_now, resume_text, jd_text)
+
+            if not target_for_sentences:
+                st.info("All optimizer keywords already appear in the resume. Nothing to add.")
+            else:
+                bullets = generate_keyword_sentences(
+                    resume_text=resume_text,
+                    jd_text=jd_text,
+                    target_keywords=target_for_sentences,
+                    provider_pref=provider,
+                    model_name=(model or None),
+                    temperature=temperature,
+                    max_tokens=min(max_tokens, 900),
+                    keys=keys
+                )
+                if bullets:
+                    # Append a small section into the editor for user review
+                    block = "\n".join([
+                        "",
+                        "Core Competencies",  # safe default section
+                        bullets.strip(),
+                        ""
+                    ])
+                    existing = st.session_state.get("tailored_edit", "") or st.session_state.get("tailored_text", "")
+                    st.session_state["tailored_edit"] = (existing + "\n" + block).strip()
+                    st.session_state["tailored_saved"] = False
+                    st.success("Generated ATS-friendly keyword sentences and added them to the editor.")
+                else:
+                    st.info("No sentences were generated.")
 
     # -----------------
     # Tailor with LLM (Top Keywords (ranked) + Gaps) — no duplication

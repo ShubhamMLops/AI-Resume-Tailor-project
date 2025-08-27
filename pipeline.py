@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional, List
 import re, json
 from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
+from ai.prompts import SYSTEM_KEYWORD_SENTENCES, USER_KEYWORD_SENTENCES
 from ai.prompts import (
     SYSTEM_TAILOR, USER_TAILOR,
     SYSTEM_KEYWORDS, USER_KEYWORDS,
@@ -195,6 +196,24 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
         lines.append("")
 
     return sanitize_markdown("\n".join(lines))
+
+def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: list,
+                               provider_pref: Optional[str], model_name: Optional[str],
+                               temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
+    """
+    Ask the LLM to produce ATS-friendly bullets that integrate the provided target keywords.
+    Returns plain text (one '• ' bullet per line).
+    """
+    provider = _provider_from_keys(provider_pref, keys or {})
+    kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
+    resp = provider.chat(
+        model=model_name,
+        system=SYSTEM_KEYWORD_SENTENCES,
+        user=USER_KEYWORD_SENTENCES.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    return sanitize_markdown(resp or "").strip()
 
 def tailor(resume_text: str, jd_text: str, provider_preference: str = None, model_name: str = None, temperature: float = 0.2, max_tokens: int = 1500, keys: Dict[str,str] = None, target_keywords: Optional[List[str]] = None, override_contacts: Optional[Dict[str,str]] = None) -> str:
     provider = _provider_from_keys(provider_preference, keys or {})
