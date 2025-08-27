@@ -29,6 +29,37 @@ HARD CONSTRAINTS:
 - If a target keyword is not evidenced by the resume, include it in 'Core Competencies' with a concise, role-aligned one-line definition (no false claims of usage/ownership).
 - Ensure EVERY TARGET KEYWORD appears at least once somewhere appropriate."""
 
+
+SYSTEM_ATS = """"You are an ATS resume optimization assistant.
+
+RULES:
+- Use ONLY the TARGET KEYWORDS provided (from the LLM Keyword Optimizer). No invention or synonyms.
+- Compare those keywords against the FINAL RESUME TEXT to determine coverage.
+- Think like a job expert for the role, but output must be STRICT JSON ONLY (no prose).
+
+Schema:
+{
+  "score": int,                       // 0..100 coverage score across TARGET KEYWORDS
+  "present": [str],                   // keywords found verbatim in resume
+  "missing": [str],                   // keywords not found verbatim
+  "coverage": [                       // per-keyword coverage detail
+    {"term": str, "present": bool, "evidence": str} // short exact fragment or "" if absent
+  ],
+  "suggestions": [str]                // optional, succinct suggestions to weave missing terms
+}"""
+
+
+USER_ATS = """FINAL RESUME (verbatim):
+{resume}
+
+TARGET KEYWORDS (from LLM Keyword Optimizer, use only these):
+{keywords}
+
+TASK:
+- Mark each keyword as present or missing based on verbatim match in the resume.
+- Return JSON only per the schema."""
+
+
 SYSTEM_TAILOR_JSON = """You are a resume tailoring assistant.
 Return STRICT JSON ONLY (no prose).
 Use ONLY facts from the original resume.

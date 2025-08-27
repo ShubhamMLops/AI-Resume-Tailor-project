@@ -3,12 +3,14 @@ from typing import Dict, Any, Optional, List
 import re, json
 from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
+
 from ai.prompts import (
     SYSTEM_TAILOR, USER_TAILOR, 
     SYSTEM_KEYWORDS, USER_KEYWORDS, 
     SYSTEM_SAMPLE_RESUME, USER_SAMPLE_RESUME,
     SYSTEM_TAILOR_JSON, USER_TAILOR_JSON,
-    SYSTEM_CONTACTS, USER_CONTACTS
+    SYSTEM_CONTACTS, USER_CONTACTS,
+    SYSTEM_ATS, USER_ATS
 )
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -92,7 +94,6 @@ def extract_contacts_llm(resume_text: str, provider_pref: Optional[str], model_n
         return out
     except Exception:
         return extract_contacts_regex(resume_text)
-
 def extract_keywords_llm(resume_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
     raw = provider.chat(model=model_name, system=SYSTEM_KEYWORDS, user=USER_KEYWORDS.format(jd=jd_text, resume=resume_text), temperature=temperature, max_tokens=max_tokens)
@@ -103,6 +104,89 @@ def extract_keywords_llm(resume_text: str, jd_text: str, provider_pref: Optional
     except Exception:
         obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
     return obj
+
+
+# def extract_ats_llm(resume_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
+#     """
+#     AI-powered ATS evaluator. Returns a dict matching SYSTEM_ATS schema.
+#     """
+#     provider = _provider_from_keys(provider_pref, keys)
+#     raw = provider.chat(
+#         model=model_name,
+#         system=SYSTEM_ATS,
+#         user=USER_ATS.format(jd=jd_text, resume=resume_text),
+#         temperature=0,                                  # deterministic scoring
+#         max_tokens=min(max_tokens, 800)
+#     )
+#     raw = (raw or "").strip().strip('`').strip()
+#     try:
+#         start = raw.find('{'); end = raw.rfind('}') + 1
+#         obj = json.loads(raw[start:end])
+#         # basic normalization
+#         obj["score"] = int(max(0, min(100, int(obj.get("score", 0)))))
+#         for k in ["strengths","gaps","missing_keywords","suggestions"]:
+#             if not isinstance(obj.get(k), list): obj[k] = []
+#         if not isinstance(obj.get("section_feedback"), dict):
+#             obj["section_feedback"] = {"summary":[], "experience":[], "skills":[], "education":[]}
+#         return obj
+#     except Exception:
+#         # safe fallback
+#         return {
+#             "score": 0, "strengths": [], "gaps": [],
+#             "missing_keywords": [], "suggestions": [],
+#             "section_feedback": {"summary":[], "experience":[], "skills":[], "education":[]}
+#         }
+
+def extract_ats_llm(
+    resume_text: str,
+    keywords: list[str],
+    provider_pref: Optional[str],
+    model_name: Optional[str],
+    temperature: float,
+    max_tokens: int,
+    keys: Dict[str,str]
+) -> Dict[str, Any]:
+    """
+    AI-powered ATS keyword coverage evaluator.
+    Compares TARGET KEYWORDS (from LLM Keyword Optimizer) against the FINAL resume text.
+    """
+    provider = _provider_from_keys(provider_pref, keys)
+
+    # Make a clean, unique list
+    token_re = re.compile(r"[A-Za-z0-9#+.]+")
+    def _canon(s: str) -> str:
+        return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+    seen = set(); clean_keywords = []
+    for k in (keywords or []):
+        c = _canon(k)
+        if c and c not in seen:
+            seen.add(c)
+            clean_keywords.append(k.strip())
+
+    kw_blob = "\n".join(f"- {k}" for k in clean_keywords)
+
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_ATS,
+        user=USER_ATS.format(resume=resume_text, keywords=kw_blob),
+        temperature=0,                                  # deterministic
+        max_tokens=min(max_tokens, 900)
+    )
+    raw = (raw or "").strip().strip('`').strip()
+    try:
+        start = raw.find('{'); end = raw.rfind('}') + 1
+        obj = json.loads(raw[start:end])
+        # normalize
+        obj["score"] = int(max(0, min(100, int(obj.get("score", 0)))))
+        for arr_key in ["present","missing","suggestions"]:
+            if not isinstance(obj.get(arr_key), list): obj[arr_key] = []
+        if not isinstance(obj.get("coverage"), list): obj["coverage"] = []
+        return obj
+    except Exception:
+        return {"score": 0, "present": [], "missing": clean_keywords, "coverage": [], "suggestions": []}
+
+
 
 def _limit_words(s: str, max_words: int = 22) -> str:
     parts = s.split()

@@ -2,6 +2,8 @@ import io, os, json, re
 import streamlit as st
 from pipeline import analyze, tailor, extract_keywords_llm, extract_contacts_llm, sanitize_markdown
 from utils import export_docx, export_pdf
+from pipeline import analyze, tailor, extract_keywords_llm, extract_contacts_llm, sanitize_markdown, extract_ats_llm
+
 
 st.set_page_config(page_title="API-only Resume Tailor (v8 final)", page_icon="🧰", layout="wide")
 st.title("🧰 API-only Resume Tailor (v8 final)")
@@ -267,20 +269,153 @@ if resume_text.strip() and jd_text.strip():
         st.session_state["tailored_text"] = (edited_text or "").strip()
         st.session_state["tailored_saved"] = True
         st.success("Saved. Exports will use your edited text.")
-        # --- NEW: ATS Scan on the edited (final) resume text ---
+    # # --- ATS Scan on the edited (final) resume text ---
+    # st.divider()
+    # st.subheader("ATS Scan (Keyword Coverage vs Final Resume)")
+
+    # use_ai_ats = st.checkbox("Use AI-powered ATS (LLM)", value=True, help="Uncheck to run fast local rule-based scan.")
+
+    # if st.button("Run ATS analysis on edited resume"):
+    #     final_text = (st.session_state.get("tailored_edit", "") or "").strip()
+    #     if not final_text:
+    #         st.warning("Please add or generate resume content first.")
+    #     else:
+    #         if use_ai_ats:
+    #             ats_llm = extract_ats_llm(final_text, jd_text, provider_pref=provider, model_name=(model or None),
+    #                                     temperature=temperature, max_tokens=max_tokens, keys=keys)
+    #             st.session_state["final_ats_llm"] = ats_llm
+    #             st.session_state["final_ats_report"] = None  # clear rule-based
+    #         else:
+    #             final_ats = analyze(final_text, jd_text)  # local, rule-based
+    #             st.session_state["final_ats_report"] = final_ats
+    #             st.session_state["final_ats_llm"] = None    # clear AI
+
+    # # Display results
+    # ats_llm = st.session_state.get("final_ats_llm")
+    # final_ats = st.session_state.get("final_ats_report")
+
+    # if use_ai_ats and ats_llm:
+    #     c1, c2 = st.columns([1,2])
+    #     with c1:
+    #         st.metric("AI ATS Score", f"{ats_llm.get('score',0)}%")
+    #     with c2:
+    #         st.write("Suggestions:")
+    #         for s in (ats_llm.get("suggestions") or []):
+    #             st.write(f"• {s}")
+    #     st.write("Strengths:")
+    #     for s in (ats_llm.get("strengths") or []):
+    #         st.write(f"• {s}")
+    #     st.write("Gaps:")
+    #     for g in (ats_llm.get("gaps") or []):
+    #         st.write(f"• {g}")
+    #     st.write("Missing keywords:", ", ".join(ats_llm.get("missing_keywords") or []) or "—")
+
+    # elif (not use_ai_ats) and final_ats:
+    #     c1, c2, c3 = st.columns([1, 1, 2])
+    #     with c1:
+    #         st.metric("Match Score (final)", f"{final_ats['match']['match_score']}%")
+    #     with c2:
+    #         st.metric("Readability (FRE)", final_ats["readability"]["flesch_reading_ease"])
+    #     with c3:
+    #         st.write("ATS warnings:")
+    #         for w in final_ats["ats"]["warnings"]:
+    #             st.write(f"• {w}")
+    #     try:
+    #         missing = [w for (w, _) in (final_ats["keywords_bow"]["missing"] or [])]
+    #     except Exception:
+    #         missing = []
+    #     st.write("Top missing keywords:", ", ".join(missing[:20]) if missing else "—")
+    # --- ATS Scan on the edited (final) resume text ---
     st.divider()
-    st.subheader("ATS Scan (Final Resume vs JD)")
+    st.subheader("ATS Scan (Keyword Coverage vs Final Resume)")
+
+    use_ai_ats = st.checkbox("Use AI-powered ATS (LLM)", value=True,
+                            help="Uncheck to run fast local rule-based scan against the JD.")
 
     if st.button("Run ATS analysis on edited resume"):
         final_text = (st.session_state.get("tailored_edit", "") or "").strip()
+        kw_obj = st.session_state.get("kw_llm") or {}
+
         if not final_text:
             st.warning("Please add or generate resume content first.")
         else:
-            final_ats = analyze(final_text, jd_text)  # uses JD paste box already
-            st.session_state["final_ats_report"] = final_ats
+            if use_ai_ats:
+                # Build keyword list from Optimizer output: ranked terms + gaps (missing), then dedupe
+                token_re = re.compile(r"[A-Za-z0-9#+.]+")
+                def _canon(s: str) -> str:
+                    return " ".join(t.lower() for t in token_re.findall(s or ""))
 
+                ranked = []
+                for item in (kw_obj.get("keywords") or []):
+                    term = (item.get("term") or "").strip()
+                    if term:
+                        ranked.append(term)
+
+                gaps = list(kw_obj.get("missing") or [])
+
+                seen = set()
+                target_keywords = []
+                for t in (ranked + gaps):
+                    c = _canon(t)
+                    if c and c not in seen:
+                        seen.add(c)
+                        target_keywords.append(t)
+
+                if not target_keywords:
+                    st.warning("No optimizer keywords available. Please run the LLM Keyword Optimizer first.")
+                else:
+                    # IMPORTANT: pass the keyword list (NOT jd_text) to the LLM ATS
+                    ats_llm = extract_ats_llm(
+                        final_text,
+                        target_keywords,
+                        provider_pref=provider,
+                        model_name=(model or None),
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        keys=keys
+                    )
+                    st.session_state["final_ats_llm"] = ats_llm
+                    st.session_state["final_ats_report"] = None  # clear rule-based
+
+            else:
+                # Local rule-based ATS vs JD (kept as optional fallback)
+                final_ats = analyze(final_text, jd_text)
+                st.session_state["final_ats_report"] = final_ats
+                st.session_state["final_ats_llm"] = None
+
+    # Display results
+    ats_llm = st.session_state.get("final_ats_llm")
     final_ats = st.session_state.get("final_ats_report")
-    if final_ats:
+
+    if use_ai_ats and ats_llm:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.metric("AI ATS Keyword Score", f"{ats_llm.get('score', 0)}%")
+        with c2:
+            st.write("Suggestions:")
+            for s in (ats_llm.get("suggestions") or []):
+                st.write(f"• {s}")
+
+        colp, colm = st.columns(2)
+        with colp:
+            st.markdown("**Present keywords**")
+            pres = ats_llm.get("present") or []
+            st.write(", ".join(pres) if pres else "—")
+        with colm:
+            st.markdown("**Missing keywords**")
+            miss = ats_llm.get("missing") or []
+            st.write(", ".join(miss) if miss else "—")
+
+        cov = ats_llm.get("coverage") or []
+        if cov:
+            st.markdown("**Coverage details (sample)**")
+            for row in cov[:10]:
+                t = row.get("term", "")
+                p = "✅" if row.get("present") else "❌"
+                ev = row.get("evidence", "")
+                st.write(f"{p} {t}: {ev}")
+
+    elif (not use_ai_ats) and final_ats:
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             st.metric("Match Score (final)", f"{final_ats['match']['match_score']}%")
@@ -290,14 +425,12 @@ if resume_text.strip() and jd_text.strip():
             st.write("ATS warnings:")
             for w in final_ats["ats"]["warnings"]:
                 st.write(f"• {w}")
-
-        # Show keyword gaps vs JD (bag-of-words)
         try:
             missing = [w for (w, _) in (final_ats["keywords_bow"]["missing"] or [])]
         except Exception:
             missing = []
         st.write("Top missing keywords:", ", ".join(missing[:20]) if missing else "—")
-    # --- END NEW ---
+
 
 
     colx1, colx2 = st.columns(2)
