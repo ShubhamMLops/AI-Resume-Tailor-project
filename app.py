@@ -185,19 +185,30 @@ if resume_text.strip() and jd_text.strip():
 
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    auto_weave = st.checkbox("Use AI keywords automatically", value=True)
-    custom_keywords = st.text_input("Optional: comma-separated custom keywords")
+    st.caption("Uses ONLY optimizer keywords; removes those already present in the resume.")
 
-    if st.button("Generate tailored resume", type="primary"):
+    # Disable generation until optimizer has run
+    can_generate = bool(st.session_state.get("kw_llm", {}).get("keywords") or st.session_state.get("kw_llm", {}).get("missing"))
+    if st.button("Generate tailored resume", type="primary", disabled=not can_generate):
         try:
             target = []
 
-            # --- Build from Top Keywords (ranked) + Gaps, deduped with same tokenizer as extractor ---
+            # --- Build from Top Keywords (ranked) + Gaps, dedupe with same tokenizer, then filter out ones already in resume ---
             if kw_obj:
-                # same matcher tokenizer
                 token_re = re.compile(r"[A-Za-z0-9#+.]+")
                 def _canon(s: str) -> str:
                     return " ".join(t.lower() for t in token_re.findall(s or ""))
+
+                def _has_term(text: str, term: str) -> bool:
+                    tt = token_re.findall((text or "").lower())
+                    kt = token_re.findall((term or "").lower())
+                    if not kt:
+                        return False
+                    L = len(kt)
+                    for i in range(0, len(tt) - L + 1):
+                        if tt[i:i+L] == kt:
+                            return True
+                    return False
 
                 ranked_terms = []
                 if kw_obj.get("keywords"):
@@ -211,23 +222,17 @@ if resume_text.strip() and jd_text.strip():
                     fallback_missing, _fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
                     gaps_terms = list(fallback_missing or [])
 
+                # Dedupe first (ranked then gaps)
                 seen = set()
+                deduped = []
                 for t in ranked_terms + gaps_terms:
                     c = _canon(t)
                     if c and c not in seen:
                         seen.add(c)
-                        target.append(t)
+                        deduped.append(t)
 
-            # Optional: still allow user-provided extras if they insist
-            if custom_keywords.strip():
-                for t in custom_keywords.split(","):
-                    term = t.strip()
-                    if term and term.lower() not in [x.lower() for x in target]:
-                        target.append(term)
-
-            # If user unchecks auto_weave, respect it (don’t pass keywords automatically)
-            if not auto_weave:
-                target = []
+                # Filter out keywords that already appear in the ORIGINAL resume (A ∩ B)
+                target = [t for t in deduped if not _has_term(resume_text, t)]
 
             override_contacts = st.session_state.get("override_contacts")
             tailored = tailor(resume_text, jd_text, provider_preference=provider, model_name=(model or None),

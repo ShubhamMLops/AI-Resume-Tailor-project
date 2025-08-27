@@ -200,18 +200,33 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
 def tailor(resume_text: str, jd_text: str, provider_preference: str = None, model_name: str = None, temperature: float = 0.2, max_tokens: int = 1500, keys: Dict[str,str] = None, target_keywords: Optional[List[str]] = None, override_contacts: Optional[Dict[str,str]] = None) -> str:
     provider = _provider_from_keys(provider_preference, keys or {})
 
-    # Deduplicate target keywords using the SAME tokenizer as extractor
+    # SAME tokenizer as extractor
     token_re = re.compile(r"[A-Za-z0-9#+.]+")
     def _canon(s: str) -> str:
         return " ".join(t.lower() for t in token_re.findall(s or ""))
 
+    def _has_term(text: str, term: str) -> bool:
+        tt = token_re.findall((text or "").lower())
+        kt = token_re.findall((term or "").lower())
+        if not kt:
+            return False
+        L = len(kt)
+        for i in range(0, len(tt) - L + 1):
+            if tt[i:i+L] == kt:
+                return True
+        return False
+
+    # 1) Deduplicate incoming keywords (ranked + gaps) using same tokenizer
     seen = set()
-    allowed = []
+    deduped = []
     for k in (target_keywords or []):
         c = _canon(k)
         if c and c not in seen:
             seen.add(c)
-            allowed.append(k)
+            deduped.append(k)
+
+    # 2) FILTER OUT keywords already present in the ORIGINAL resume (A ∩ B)
+    allowed = [k for k in deduped if not _has_term(resume_text, k)]
 
     kw_blob = "\n".join(f"- {k}" for k in allowed)
 
@@ -222,6 +237,7 @@ phone={contacts.get('phone','')}
 linkedin={contacts.get('linkedin','')}
 github={contacts.get('github','')}"""
 
+    # ---- Try structured JSON path first
     raw = provider.chat(
         model=model_name,
         system=SYSTEM_TAILOR_JSON,
@@ -230,13 +246,68 @@ github={contacts.get('github','')}"""
         max_tokens=max_tokens
     ).strip()
 
+    txt = ""
     try:
         start = raw.find("{"); end = raw.rfind("}") + 1
         obj = json.loads(raw[start:end])
         txt = render_text_from_json(obj)
-        if txt: return txt
     except Exception:
         pass
 
-    out = provider.chat(model=model_name, system=SYSTEM_TAILOR, user=USER_TAILOR.format(jd=jd_text, resume=resume_text, keywords=kw_blob), temperature=temperature, max_tokens=max_tokens)
-    return sanitize_markdown(out)
+    if not txt:
+        out = provider.chat(
+            model=model_name,
+            system=SYSTEM_TAILOR,
+            user=USER_TAILOR.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        txt = sanitize_markdown(out)
+
+    # 3) GUARANTEE COVERAGE: ensure every 'allowed' keyword appears at least once
+    missing_terms = [k for k in allowed if not _has_term(txt, k)]
+    if missing_terms:
+        lines = txt.splitlines()
+
+        # Find "Core Competencies" section; else we'll create it before Technical Skills / Work Experience / end
+        comp_idx = None
+        for idx, ln in enumerate(lines):
+            if ln.strip() == "Core Competencies":
+                comp_idx = idx
+                break
+
+        # Build one-liner bullets for missing terms
+        bullets = [f"• {k}: role-aligned capability as required by the job description." for k in missing_terms]
+
+        if comp_idx is not None:
+            # Insert bullets right after the "Core Competencies" heading, keeping spacing tidy
+            insert_at = comp_idx + 1
+            # Ensure one blank line after heading if needed
+            if insert_at >= len(lines) or (lines[insert_at].strip() and not lines[insert_at].startswith("• ")):
+                lines.insert(insert_at, "")
+                insert_at += 1
+            for b in bullets:
+                lines.insert(insert_at, b)
+                insert_at += 1
+            # Add a trailing blank line if next line is non-blank and not a bullet
+            if insert_at < len(lines) and lines[insert_at].strip() and not lines[insert_at].startswith("• "):
+                lines.insert(insert_at, "")
+        else:
+            # Create section near the top (before common anchors) or at end
+            anchors = {"Technical Skills","Work Experience","Education","Certifications","Projects"}
+            anchor_idx = None
+            for idx, ln in enumerate(lines):
+                if ln.strip() in anchors:
+                    anchor_idx = idx
+                    break
+            block = ["Core Competencies", *bullets, ""]
+            if anchor_idx is not None:
+                lines[anchor_idx:anchor_idx] = block
+            else:
+                if lines and lines[-1].strip():
+                    lines.append("")  # ensure spacing
+                lines.extend(block)
+
+        txt = sanitize_markdown("\n".join(lines))
+
+    return txt
