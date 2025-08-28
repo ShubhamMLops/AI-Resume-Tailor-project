@@ -1,3 +1,8 @@
+Perfect 👍 Based on your current project (with **Keyword Sentence Generator (ATS-friendly)** restricted to **Core Competencies**, better tailoring, export features, etc.), here’s a polished **`README.md`** tailored to your repo:
+
+---
+
+````markdown
 # 🚀 AI Resume Tailor (v8 Final)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
@@ -5,16 +10,13 @@
 An intelligent **Streamlit** application that analyzes and tailors resumes against job descriptions using powerful AI models.  
 This tool ensures your resume is **ATS-friendly**, **keyword-optimized**, and **professionally exportable** in both DOCX and PDF formats.
 
-<br>
 
-*Screenshot: The analysis dashboard showing contacts, ATS checks, and tailoring options.*
 
----
 
 ## ✨ Why This Project?
 
 Tailoring a resume for every job can be repetitive and time-consuming.  
-This tool automates the process by combining **LLM intelligence** with ATS checks, ensuring your resume is always aligned with the target job description.
+This tool automates the process by combining **LLM intelligence** with ATS checks, ensuring your resume is always aligned with the target job description — **with Core Competencies enhanced automatically**.
 
 ---
 
@@ -22,19 +24,25 @@ This tool automates the process by combining **LLM intelligence** with ATS check
 
 ### 🔬 Analysis & Insights
 - **Contact Extraction**: Auto-detects name, email, phone, LinkedIn, GitHub (regex + AI refinement).
-- **ATS Score**: Quick compatibility check with Applicant Tracking Systems.
+- **ATS Score**: AI-powered keyword coverage vs final resume.
 - **Readability (FRE)**: Evaluates readability using the Flesch Reading Ease score.
 - **Warnings & Gaps**: Flags issues like short resumes, first-person pronouns, or missing keywords.
+- **Domain-Aware Keyword Extraction**: Detects role/domain, then extracts **tools, frameworks, and languages** tailored to that job.
+
+### 🧩 Keyword Sentence Generator (ATS-Friendly)
+- Generates **Core Competencies–only** keyword sentences.  
+- Uses **Top Keywords (ranked) + Gaps**, compares with resume, and generates only new/needed bullets.  
+- Sentences are **technically accurate**, **contextually relevant**, and **ATS-optimized**.  
+- Fully editable before integration, with a **Save** option.
 
 ### 🤖 AI-Powered Tailoring
 - **Multiple Backends**: Works with **Google Gemini**, **OpenAI GPT**, and **Anthropic Claude**.
-- **Strict JSON Parsing**: Ensures clean structure with consistent sections.
-- **Keyword Weaving**: Naturally integrates job description keywords into your resume sections.
-- **Fallback to Plain-Text**: Always produces output, even if JSON parse fails.
+- **Resume Integration**: Blends your resume + saved keyword sentences seamlessly, avoiding duplication.
+- **Strict Expert Guidance**: AI behaves like a professional resume writer, ensuring output looks **native, structured, and polished**.
 
 ### 📄 Professional Document Export
 - **DOCX Export**: Clean, editable `.docx` with colored section headings.
-- **PDF Export**: High-quality `.pdf` with the same professional formatting.
+- **PDF Export**: High-quality `.pdf` with consistent formatting.
 - **Consistent Styling**: Headings in **#1F4E79** (deep blue), bullets as `•`.
 
 ---
@@ -62,9 +70,10 @@ This tool automates the process by combining **LLM intelligence** with ATS check
    ```bash
    git clone https://github.com/your-username/ai-resume-tailor-v8-final.git
    cd ai-resume-tailor-v8-final
-   ```
+````
 
 2. Create and activate a virtual environment:
+
    ```bash
    # macOS/Linux
    python3 -m venv venv
@@ -76,11 +85,13 @@ This tool automates the process by combining **LLM intelligence** with ATS check
    ```
 
 3. Install dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
 
 4. Run the app:
+
    ```bash
    streamlit run app.py
    ```
@@ -92,9 +103,10 @@ This tool automates the process by combining **LLM intelligence** with ATS check
 ## ⚙️ Configuration
 
 All configuration is handled in the **sidebar**:
-- **API Keys**: Paste your key for OpenAI, Gemini, or Anthropic.
-- **Provider & Model**: Choose your provider and optionally set a model name.
-- **Parameters**: Adjust `temperature` and `max tokens`.
+
+* **API Keys**: Paste your key for OpenAI, Gemini, or Anthropic.
+* **Provider & Model**: Choose your provider and optionally set a model name.
+* **Parameters**: Adjust `temperature` and `max tokens` for generation.
 
 ---
 
@@ -103,7 +115,7 @@ All configuration is handled in the **sidebar**:
 ```
 .
 ├── app.py              # Streamlit app (UI + workflow)
-├── pipeline.py         # Core logic: analysis, tailoring, JSON handling
+├── pipeline.py         # Core logic: analysis, tailoring, keyword generation
 ├── utils.py            # Export helpers for DOCX & PDF
 ├── ai/
 │   ├── providers.py    # Wrapper classes for OpenAI, Gemini, Anthropic
@@ -118,17 +130,24 @@ All configuration is handled in the **sidebar**:
 
 ## 🤝 Contributing
 
-Contributions are welcome!  
+Contributions are welcome!
 To contribute:
 
-1. Fork this repo  
-2. Create a feature branch (`git checkout -b feature/NewFeature`)  
-3. Commit changes (`git commit -m 'Add new feature'`)  
-4. Push to branch (`git push origin feature/NewFeature`)  
-5. Open a Pull Request  
+1. Fork this repo
+2. Create a feature branch (`git checkout -b feature/NewFeature`)
+3. Commit changes (`git commit -m 'Add new feature'`)
+4. Push to branch (`git push origin feature/NewFeature`)
+5. Open a Pull Request
 
 ---
 
 ## 📜 License
 
 This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
+
+```
+
+---
+
+Would you like me to also **add screenshots section** (with placeholders) in this README so that later you just drop `.png` files in a `/screenshots` folder and link them? That way your repo looks even more polished.
+```
