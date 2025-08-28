@@ -1,7 +1,3 @@
-Perfect 👍 Based on your current project (with **Keyword Sentence Generator (ATS-friendly)** restricted to **Core Competencies**, better tailoring, export features, etc.), here’s a polished **`README.md`** tailored to your repo:
-
----
-
 ````markdown
 # 🚀 AI Resume Tailor (v8 Final)
 
