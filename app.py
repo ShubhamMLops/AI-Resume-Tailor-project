@@ -6,10 +6,63 @@ from pipeline import (
     tailor,
     extract_keywords_llm,
     extract_contacts_llm,
+    polish_keyword_sentences,
     sanitize_markdown,
     extract_ats_llm_from_optimizer,  # AI ATS helper
     generate_keyword_sentences
 )
+
+# -------------------------
+# Fix 1A: Stable editor/download state (ADD ONCE NEAR TOP)
+# -------------------------
+if "tailored_text" not in st.session_state:
+    st.session_state["tailored_text"] = ""
+if "tailored_edit" not in st.session_state:
+    st.session_state["tailored_edit"] = ""
+if "tailored_saved" not in st.session_state:
+    st.session_state["tailored_saved"] = False
+
+# Reusable token regex used elsewhere as well
+_TOKEN_RE = re.compile(r"[A-Za-z0-9#+.]+")
+def _tok_seq(s: str):
+    return [t.lower() for t in _TOKEN_RE.findall(s or "")]
+
+def _canon(s: str) -> str:
+    return " ".join(_tok_seq(s))
+
+def _present_line(base_text: str, line: str) -> bool:
+    base_tokens = _tok_seq(base_text)
+    base_compact = "".join(base_tokens)
+    kt = _tok_seq(line)
+    if not kt:
+        return True
+    L = len(kt)
+    for i in range(0, len(base_tokens) - L + 1):
+        if base_tokens[i:i+L] == kt:
+            return True
+    if "".join(kt) in base_compact:
+        return True
+    if L == 1 and len(kt[0]) > 3:
+        w = kt[0]
+        alt = w[:-1] if w.endswith("s") else w + "s"
+        if w in base_tokens or alt in base_tokens:
+            return True
+    return False
+
+def insert_block_after_profile_summary(resume_text: str, block_text: str) -> str:
+    """
+    Insert block_text immediately after a 'Profile Summary' heading (case-insensitive),
+    else prepend it at the top. Keeps plain-text formatting.
+    """
+    m = re.search(r"(?im)^(profile\s*summary)\s*$", resume_text)
+    if not m:
+        return (block_text.strip() + "\n\n" + resume_text.strip()).strip()
+
+    insert_pos = m.end()
+    before = resume_text[:insert_pos]
+    after  = resume_text[insert_pos:]
+    glue = "\n" if not before.endswith("\n") else ""
+    return (before + glue + "\n" + block_text.strip() + "\n\n" + after.lstrip("\n")).strip()
 
 st.set_page_config(page_title="API-only Resume Tailor (v8 final)", page_icon="🧰", layout="wide")
 st.title("🧰 API-only Resume Tailor (v8 final)")
@@ -43,8 +96,11 @@ def read_textarea_or_file(label: str, key_text: str, key_file: str) -> str:
             txt = up.read().decode("utf-8", errors="ignore")
         elif ext == "pdf":
             try:
+                from pdfminer_high_level import extract_text
+            except Exception:
                 from pdfminer.high_level import extract_text
-                import tempfile
+            import tempfile
+            try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(up.read()); tmp.flush()
                     txt = extract_text(tmp.name) or ""
@@ -162,68 +218,49 @@ if resume_text.strip() and jd_text.strip():
             weak_terms = []
         return missing_terms, weak_terms
 
-    # === ADDED: helper to build target keywords from Top Keywords (ranked) + Gaps, deduped, and excluding ones already in resume ===
+    # === helper to build target keywords from Top Keywords (ranked) + Gaps, deduped, and excluding ones already in resume ===
     def build_target_keywords_from_optimizer(kw_obj, resume_text: str, jd_text: str):
-        """
-        Build final target keywords from:
-        - Top Keywords (ranked) + ALL their variants (outlets)
-        - Gaps (missing) or fallback
-        Then:
-        - Dedupe canonically (punctuation/case insensitive)
-        - EXCLUDE anything already present in the ORIGINAL resume
-            (match against term OR any variant; handles 'CI/CD' ~ 'cicd' and simple plural/singular)
-        """
         if not kw_obj:
             return []
 
         token_re = re.compile(r"[A-Za-z0-9#+.]+")
 
-        def _canon(s: str) -> str:
+        def _canon_local(s: str) -> str:
             return " ".join(t.lower() for t in token_re.findall(s or ""))
 
-        def _tok_seq(s: str):
+        def _tok_seq_local(s: str):
             return [t.lower() for t in token_re.findall(s or "")]
 
-        # Resume tokens + compacted view (for CI/CD ~ cicd)
-        resume_tokens = _tok_seq(resume_text)
+        resume_tokens = _tok_seq_local(resume_text)
         resume_compact = "".join(resume_tokens)
 
         def _present(term: str) -> bool:
-            kt = _tok_seq(term)
+            kt = _tok_seq_local(term)
             if not kt:
                 return False
             L = len(kt)
-
-            # A) exact token-sequence
             for i in range(0, len(resume_tokens) - L + 1):
                 if resume_tokens[i:i+L] == kt:
                     return True
-
-            # B) compacted (handles CI/CD -> cicd)
             k_comp = "".join(kt)
             if k_comp and k_comp in resume_compact:
                 return True
-
-            # C) simple plural/singular toggle (avoid breaking short acronyms)
             if L == 1 and len(kt[0]) > 3:
                 base = kt[0]
                 alt = base[:-1] if base.endswith("s") else base + "s"
                 if base in resume_tokens or alt in resume_tokens:
                     return True
-
             return False
 
-        # (1) Collect ALL outlets: each Top Keyword (ranked) followed by its variants
         outlets_ordered = []
         for item in (kw_obj.get("keywords") or []):
             base = (item.get("term") or "").strip()
             if not base:
                 continue
             variants = [v.strip() for v in (item.get("variants") or []) if v and v.strip()]
-            outlets_ordered.append(base)           # base first
-            outlets_ordered.extend(variants)       # then all variants
+            outlets_ordered.append(base)
+            outlets_ordered.extend(variants)
 
-        # (2) Append Gaps (or fallback if empty)
         gaps_terms = list(kw_obj.get("missing") or [])
         if not gaps_terms:
             try:
@@ -236,18 +273,15 @@ if resume_text.strip() and jd_text.strip():
             if g:
                 outlets_ordered.append(g)
 
-        # (3) Dedupe by canonical form while preserving order
         seen, deduped = set(), []
         for t in outlets_ordered:
-            c = _canon(t)
+            c = _canon_local(t)
             if c and c not in seen:
                 seen.add(c)
                 deduped.append(t)
 
-        # (4) Remove anything already present in the original resume
         target = [t for t in deduped if not _present(t)]
         return target
-    # === END REPLACE ===
 
     if kw_obj:
         st.write(kw_obj.get("summary",""))
@@ -268,13 +302,14 @@ if resume_text.strip() and jd_text.strip():
             st.markdown("**Gaps**")
             missing = kw_obj.get("missing")
             weak = kw_obj.get("weak")
-            if not missing or not isinstance(missing, list) or not weak or not isinstance(weak, list):
+            if not missing or not isinstance(missing, list) or not isinstance(weak, list):
                 fallback_missing, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                if not missing or not isinstance(missing, list): missing = fallback_missing
-                if not weak or not isinstance(weak, list): weak = fallback_weak
+                if not isinstance(missing, list) or not missing: missing = fallback_missing
+                if not isinstance(weak, list) or not weak: weak = fallback_weak
             st.write("Missing:", ", ".join(missing) if missing else "—")
             st.write("Weak:", ", ".join(weak) if weak else "—")
-        # -----------------
+
+    # -----------------
     # Keyword Sentence Generator (ATS-friendly) — SEPARATE EDITOR
     # -----------------
     st.subheader("Keyword Sentence Generator (ATS-friendly)")
@@ -293,11 +328,99 @@ if resume_text.strip() and jd_text.strip():
             else:
                 # Build target list: Top Keywords (ranked) + Gaps, deduped
                 target_for_sentences = build_target_keywords_from_optimizer(kw_obj, resume_text, jd_text)
+
+                # =========================================
+                # NEW: Full target set and accurate present vs new (variants-aware)
+                # =========================================
+                TOKEN_RE = re.compile(r"[A-Za-z0-9#+.]+")
+                def _tok_seq_local2(s: str):
+                    return [t.lower() for t in TOKEN_RE.findall(s or "")]
+                def _canon_local2(s: str) -> str:
+                    return " ".join(_tok_seq_local2(s))
+
+                ranked_terms = []
+                for it in (kw_obj.get("keywords") or []):
+                    term = (it.get("term") or "").strip()
+                    if term:
+                        ranked_terms.append(term)
+
+                gaps_terms = list(kw_obj.get("missing") or [])
+                if not gaps_terms:
+                    try:
+                        fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
+                    except Exception:
+                        fallback_missing = []
+                    gaps_terms = list(fallback_missing or [])
+
+                seen, target_all = set(), []
+                for t in ranked_terms + gaps_terms:
+                    c = _canon_local2(t)
+                    if c and c not in seen:
+                        seen.add(c)
+                        target_all.append(t)
+
+                variants_map = {}
+                for it in (kw_obj.get("keywords") or []):
+                    term = (it.get("term") or "").strip()
+                    if not term:
+                        continue
+                    forms = [term] + [v for v in (it.get("variants") or []) if v and v.strip()]
+                    expanded = set()
+                    for f in forms:
+                        f = f.strip()
+                        if not f:
+                            continue
+                        expanded.add(f)
+                        expanded.add(f.replace("-", " "))
+                        expanded.add(f.replace("/", " "))
+                    variants_map[_canon_local2(term)] = list(expanded)
+
+                presence_text = (st.session_state.get("tailored_edit") or resume_text or "")
+                text_tokens = _tok_seq_local2(presence_text)
+
+                def _has_seq(tokens, cand: str) -> bool:
+                    seq = _tok_seq_local2(cand)
+                    L = len(seq)
+                    if L == 0:
+                        return False
+                    for i in range(0, len(tokens) - L + 1):
+                        if tokens[i:i+L] == seq:
+                            return True
+                    if L == 1 and len(seq[0]) > 3:
+                        w = seq[0]
+                        alt = w[:-1] if w.endswith("s") else w + "s"
+                        return (w in tokens) or (alt in tokens)
+                    return False
+
+                present_keywords, new_keywords = [], []
+                for t in target_all:
+                    key = _canon_local2(t)
+                    cand_forms = variants_map.get(key, [t, t.replace("-", " "), t.replace("/", " ")])
+                    seen_forms, cand_forms_dedup = set(), []
+                    for f in cand_forms:
+                        f = (f or "").strip()
+                        if not f:
+                            continue
+                        kf = f.lower()
+                        if kf in seen_forms:
+                            continue
+                        seen_forms.add(kf)
+                        cand_forms_dedup.append(f)
+                    found = any(_has_seq(text_tokens, f) for f in cand_forms_dedup)
+                    (present_keywords if found else new_keywords).append(t)
+
+                with st.expander("🔍 New keywords for your resume (not currently found)", expanded=True):
+                    st.write(", ".join(new_keywords) if new_keywords else "— none —")
+                with st.expander("✅ Already present (will NOT be generated again)", expanded=False):
+                    st.write(", ".join(present_keywords) if present_keywords else "— none —")
+
+                target_for_sentences = new_keywords
+
                 if not target_for_sentences:
                     st.info("All optimizer keywords already appear in the resume. Nothing to add.")
                 else:
-                    bullets = generate_keyword_sentences(
-                        resume_text=resume_text,
+                    bullets_raw = generate_keyword_sentences(
+                        resume_text=presence_text,
                         jd_text=jd_text,
                         target_keywords=target_for_sentences,
                         provider_pref=provider,
@@ -306,8 +429,41 @@ if resume_text.strip() and jd_text.strip():
                         max_tokens=min(max_tokens, 900),
                         keys=keys
                     )
-                    st.session_state["kw_sentences_edit"] = (bullets or "").strip()
-                    st.success("Generated bullets. Review below, edit, then click Save.")
+
+                    try:
+                        polished = polish_keyword_sentences(
+                            resume_text=presence_text,
+                            bullets_text=(bullets_raw or "").strip(),
+                            jd_text=jd_text,
+                            provider_pref=provider,
+                            model_name=(model or None),
+                            temperature=temperature,
+                            max_tokens=min(max_tokens, 800),
+                            keys=keys
+                        )
+                        out_text = polished
+                    except Exception:
+                        out_text = (bullets_raw or "")
+
+                    TOKEN_RE2 = re.compile(r"[A-Za-z0-9#+.]+")
+                    def _canon_line(s: str) -> str:
+                        return " ".join(t.lower() for t in TOKEN_RE2.findall(s or ""))
+
+                    seen_lines, lines_out = set(), []
+                    for ln in (out_text.splitlines() if out_text else []):
+                        s = ln.strip()
+                        if not s:
+                            continue
+                        c = _canon_line(s)
+                        if c in seen_lines:
+                            continue
+                        seen_lines.add(c)
+                        if not s.startswith("• "):
+                            s = "• " + s.lstrip("-").lstrip("•").strip()
+                        lines_out.append(s)
+
+                    st.session_state["kw_sentences_edit"] = "\n".join(lines_out).strip()
+                    st.success("Generated ATS-friendly keyword sentences. Review below, edit, then click Save.")
 
     with col_clear:
         if st.button("Clear keyword sentences", key="btn_kw_sentences_clear"):
@@ -322,223 +478,137 @@ if resume_text.strip() and jd_text.strip():
         st.success("Saved. Tailor with LLM will integrate these into the resume.")
 
     # -----------------
-    # Generate ATS-friendly keyword sentences (from Top Keywords (ranked) + Gaps)
-    # # -----------------
-    # st.subheader("Keyword Sentence Generator (ATS-friendly)")
-    # st.caption("Reads your resume context and creates concise bullets that naturally integrate Top Keywords (ranked) + Gaps.")
-
-    # if st.button("Generate ATS-friendly keyword sentences"):
-    #     kw_obj_now = st.session_state.get("kw_llm")
-    #     if not kw_obj_now:
-    #         st.warning("Please run the LLM Keyword Optimizer first.")
-    #     else:
-    #         # Build final target list (variants-aware, deduped, skip already-present)
-    #         target_for_sentences = build_target_keywords_from_optimizer(kw_obj_now, resume_text, jd_text)
-
-    #         if not target_for_sentences:
-    #             st.info("All optimizer keywords already appear in the resume. Nothing to add.")
-    #         else:
-    #             bullets = generate_keyword_sentences(
-    #                 resume_text=resume_text,
-    #                 jd_text=jd_text,
-    #                 target_keywords=target_for_sentences,
-    #                 provider_pref=provider,
-    #                 model_name=(model or None),
-    #                 temperature=temperature,
-    #                 max_tokens=min(max_tokens, 900),
-    #                 keys=keys
-    #             )
-    #             if bullets:
-    #                 # Append a small section into the editor for user review
-    #                 block = "\n".join([
-    #                     "",
-    #                     "Core Competencies",  # safe default section
-    #                     bullets.strip(),
-    #                     ""
-    #                 ])
-    #                 existing = st.session_state.get("tailored_edit", "") or st.session_state.get("tailored_text", "")
-    #                 st.session_state["tailored_edit"] = (existing + "\n" + block).strip()
-    #                 st.session_state["tailored_saved"] = False
-    #                 st.success("Generated ATS-friendly keyword sentences and added them to the editor.")
-    #             else:
-    #                 st.info("No sentences were generated.")
-
-        # -----------------
-    # -----------------
-    # # Tailor with LLM (API-only) — integrates ONLY Resume + SAVED Keyword Sentences
-    # st.caption("Integrates your Resume + SAVED Keyword Sentence Generator text into a natural, ATS-friendly professional resume. (No optimizer keyword weaving.)")
-
-    # if st.button("Generate tailored resume", type="primary", key="btn_tailor_generate"):
-    #     if not resume_text.strip():
-    #         st.warning("Please paste or upload your resume text first.")
-    #     else:
-    #         try:
-    #             saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
-
-    #             # Base text = original resume + your SAVED keyword sentences
-    #             base_resume_for_llm = (resume_text + ("\n\n" + saved_kw_sentences if saved_kw_sentences else "")).strip()
-
-    #             override_contacts = st.session_state.get("override_contacts")
-
-    #             tailored = tailor(
-    #                 base_resume_for_llm,    # ✅ resume + your saved bullets
-    #                 jd_text,
-    #                 provider_preference=provider,
-    #                 model_name=(model or None),
-    #                 temperature=temperature,
-    #                 max_tokens=max_tokens,  # ✅ uses updated slider
-    #                 keys=keys,
-    #                 target_keywords=[],     # ✅ no optimizer keywords here
-    #                 override_contacts=override_contacts
-    #             )
-
-    #             final_txt = sanitize_markdown(tailored)
-    #             st.session_state["tailored_text"] = final_txt
-    #             st.session_state["tailored_edit"] = final_txt
-    #             st.session_state["tailored_saved"] = False
-
-    #             if saved_kw_sentences:
-    #                 st.success("Tailored resume generated. Your saved keyword sentences were integrated. Review and click Save before exporting.")
-    #             else:
-    #                 st.success("Tailored resume generated from your resume content. Review and click Save before exporting.")
-    #         except Exception as e:
-    #             st.error(str(e))
-
-    # -----------------
-    # Tailor with LLM (API-only) — integrates ONLY Resume + SAVED Keyword Sentences, with de-duplication
+    # Tailor with LLM (API-only) — integrates ONLY Resume + SAVED Keyword Sentences,
+    # de-duplicates, and refines existing mentions to look native and professional.
     # -----------------
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    st.caption("Integrates your Resume + SAVED Keyword Sentence Generator text into a natural, ATS-friendly professional resume. (No optimizer weaving here.)")
-
-    # Helper: token-aware canonicalization to compare lines with resume content
-    _token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    def _tok_seq(s: str):
-        return [t.lower() for t in _token_re.findall(s or "")]
-
-    def _canon(s: str) -> str:
-        return " ".join(_tok_seq(s))
-
-    def _present_line(base_text: str, line: str) -> bool:
-        """
-        Returns True if the line is already present in base_text.
-        Matching rules:
-        - exact token-sequence match (punctuation/case-insensitive)
-        - compacted match (CI/CD -> cicd)
-        - simple plural/singular toggle for single-token words (avoid short acronyms)
-        """
-        base_tokens = _tok_seq(base_text)
-        base_compact = "".join(base_tokens)
-
-        kt = _tok_seq(line)
-        if not kt:
-            return True  # empty/whitespace line—treat as present (skip)
-
-        # A) exact token sequence
-        L = len(kt)
-        for i in range(0, len(base_tokens) - L + 1):
-            if base_tokens[i:i+L] == kt:
-                return True
-
-        # B) compacted match (e.g., "CI/CD pipelines" tokens -> "cicd" inside base)
-        k_comp = "".join(kt)
-        if k_comp and k_comp in base_compact:
-            return True
-
-        # C) simple plural/singular for single-token lines with >3 chars (avoid acronyms)
-        if L == 1 and len(kt[0]) > 3:
-            base_word = kt[0]
-            alt = base_word[:-1] if base_word.endswith("s") else base_word + "s"
-            if base_word in base_tokens or alt in base_tokens:
-                return True
-
-        return False
+    st.caption("Integrates your Resume + SAVED Keyword Sentence Generator text so it reads like original experience (no copy-paste feel), avoids duplicates, and refines existing mentions.")
 
     if st.button("Generate tailored resume", type="primary", key="btn_tailor_generate"):
         if not resume_text.strip():
             st.warning("Please paste or upload your resume text first.")
         else:
             try:
-                # 1) Get your SAVED keyword sentences (from the separate editor)
+                # 1) Read SAVED keyword sentences from the separate editor
                 saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
 
-                # 2) Split saved sentences into individual bullets/lines
+                # 2) Split & clean
                 raw_lines = [ln.strip() for ln in (saved_kw_sentences.splitlines() if saved_kw_sentences else [])]
-                # keep only non-empty lines (bullets or sentences)
                 raw_lines = [ln for ln in raw_lines if ln]
 
-                # 3) De-duplicate:
-                #    - remove lines that are already present in the resume (token-aware)
-                #    - remove internal duplicates between saved lines (canonical, order-preserving)
-                filtered_lines = []
-                seen_lines = set()
+                # 3) Decide: add vs refine (NO placement logic here)
+                lines_to_add, refine_hints, seen_lines = [], [], set()
                 for ln in raw_lines:
-                    # strip leading bullets like "• " or "- "
                     ln_clean = ln.lstrip("•").lstrip("-").strip()
                     if not ln_clean:
                         continue
-                    # skip if this exact canonical line already added
                     c = _canon(ln_clean)
                     if c in seen_lines:
                         continue
-                    # skip if resume already contains this content
-                    if _present_line(resume_text, ln_clean):
-                        continue
                     seen_lines.add(c)
-                    # ensure output bullets start with "• "
-                    if not ln_clean.startswith("• "):
-                        ln_clean = "• " + ln_clean
-                    filtered_lines.append(ln_clean)
 
-                # 4) Build base input for the LLM: resume + de-duped saved bullets (as a short section)
-                if filtered_lines:
-                    add_block = "\n".join(["", "Core Competencies"] + filtered_lines + [""])
-                    base_resume_for_llm = (resume_text + "\n\n" + add_block).strip()
-                else:
-                    base_resume_for_llm = resume_text.strip()
+                    if _present_line(resume_text, ln_clean):
+                        refine_hints.append(ln_clean)
+                    else:
+                        if not ln_clean.startswith("• "):
+                            ln_clean = "• " + ln_clean
+                        lines_to_add.append(ln_clean)
+
+                # 4) Build input for LLM: base resume + integration notes (let AI choose placement)
+                blocks = [resume_text.strip()]
+
+                if refine_hints or lines_to_add:
+                    guidance = [
+                        "",
+                        "Integration Notes (for model):",
+                        "- Integrate the following without duplicating existing content.",
+                        "- If a theme already exists, refine in-place; do not add a new line.",
+                        "- Choose the most appropriate existing section (e.g., Core Competencies/Skills, Technical Skills, or a relevant role).",
+                        "- NEVER place added lines at the very top of the document or the very end.",
+                        # >>> ADD THIS LINE <<<
+                        "- Treat ALL added lines below as 'Core Competencies' content; do NOT place them under Work Experience or Projects.",
+                    ]
+                    if refine_hints:
+                        guidance += ["", "Refine these existing themes:"]
+                        guidance += [f"- {h}" for h in refine_hints]
+                    if lines_to_add:
+                        guidance += ["", "Add these lines naturally (responsibility-style):"]
+                        guidance += lines_to_add
+
+                    blocks.append("\n".join(guidance))
+
+                base_resume_for_llm = "\n\n".join(blocks).strip()
 
                 override_contacts = st.session_state.get("override_contacts")
 
-                # 5) Call tailor() to integrate/structure—no optimizer keywords here
                 tailored = tailor(
-                    base_resume_for_llm,        # resume + (optional) deduped bullet block
+                    base_resume_for_llm,
                     jd_text,
                     provider_preference=provider,
                     model_name=(model or None),
                     temperature=temperature,
-                    max_tokens=max_tokens,      # ensure your sidebar slider allows large outputs
+                    max_tokens=max_tokens,
                     keys=keys,
-                    target_keywords=[],          # <-- IMPORTANT: no optimizer keywords in this flow
+                    target_keywords=[],  # do not pull from optimizer in this flow
                     override_contacts=override_contacts
                 )
 
-                # 6) Show in editor (unsaved until user clicks Save)
-                final_txt = sanitize_markdown(tailored)
+                # -------------------------
+                # Fix 2: Normalize spacing after tailoring (REPLACE this part)
+                # -------------------------
+                def _normalize(s: str) -> str:
+                    s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)  # trim trailing spaces per line
+                    s = re.sub(r"\n{3,}", "\n\n", s)                   # collapse >2 blank lines
+                    return s.strip()
+
+                final_txt = _normalize(sanitize_markdown(tailored))
                 st.session_state["tailored_text"] = final_txt
-                st.session_state["tailored_edit"] = final_txt
+                st.session_state["tailored_edit"]  = final_txt   # keep editor populated
                 st.session_state["tailored_saved"] = False
 
-                if filtered_lines:
-                    st.success("Tailored resume generated. Your saved keyword sentences were integrated without duplicates. Review and click Save before exporting.")
-                elif saved_kw_sentences:
-                    st.info("Your saved sentences were already present in the resume, so nothing new was added. The resume was still tailored.")
+                if lines_to_add and refine_hints:
+                    st.success("Tailored resume generated. New keyword sentences were integrated naturally and existing mentions were refined. Review and click Save before exporting.")
+                elif lines_to_add:
+                    st.success("Tailored resume generated. Your keyword sentences were integrated without duplicates. Review and click Save before exporting.")
+                elif refine_hints:
+                    st.success("Tailored resume generated. Existing keyword mentions were refined for clarity and impact (no duplicates added). Review and click Save before exporting.")
                 else:
-                    st.success("Tailored resume generated from your resume content. (No saved keyword sentences were provided.)")
-
+                    st.info("No new keyword sentences found and nothing specific to refine. The resume was still tailored for structure and clarity.")
             except Exception as e:
                 st.error(str(e))
 
-
-
-    # Editor + Save
-    if "tailored_edit" not in st.session_state:
-        st.session_state["tailored_edit"] = st.session_state.get("tailored_text", "")
+    # -------------------------
+    # Fix 1B: Editor always visible; Save doesn't clear it; downloads show immediately when saved
+    # (REPLACE your existing editor + export sections with THIS block)
+    # -------------------------
     edited_text = st.text_area("Tailored resume (plain text)", key="tailored_edit", height=420)
 
-    if st.button("💾 Save", key="btn_tailored_save"):
-        st.session_state["tailored_text"] = (edited_text or "").strip()
+    if st.button("💾 Save", key="btn_tailor_save"):
+        def _normalize_save(s: str) -> str:
+            s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)
+            s = re.sub(r"\n{3,}", "\n\n", s)
+            return s.strip()
+        st.session_state["tailored_text"] = _normalize_save(edited_text or "")
         st.session_state["tailored_saved"] = True
         st.success("Saved. Exports will use your edited text.")
+
+    saved_text = (st.session_state.get("tailored_text", "") or "").strip()
+    colx1, colx2 = st.columns(2)
+    with colx1:
+        if st.session_state.get("tailored_saved") and saved_text:
+            out_path = export_docx(saved_text, "tailored_resume.docx")
+            with open(out_path, "rb") as f:
+                st.download_button("⬇️ Download DOCX", f, file_name="tailored_resume.docx", key="dl_docx")
+        else:
+            st.info("Click Save to enable DOCX download.")
+    with colx2:
+        if st.session_state.get("tailored_saved") and saved_text:
+            out_path = export_pdf(saved_text, "tailored_resume.pdf")
+            with open(out_path, "rb") as f:
+                st.download_button("⬇️ Download PDF", f, file_name="tailored_resume.pdf", key="dl_pdf")
+        else:
+            st.info("Click Save to enable PDF download.")
 
     # -----------------
     # ATS Scan (AI) + local reconciliation
@@ -567,9 +637,8 @@ if resume_text.strip() and jd_text.strip():
             )
             st.session_state["final_ats_llm"] = ats_llm
 
-            # Reconcile deterministically (token/variant aware + compacted match)
             token_re = re.compile(r"[A-Za-z0-9#+.]+")
-            def _canon(s: str) -> str:
+            def _canon_local3(s: str) -> str:
                 return " ".join(t.lower() for t in token_re.findall(s or ""))
 
             ranked = [(it.get("term") or "").strip() for it in (kw_obj_now.get("keywords") or []) if (it.get("term") or "").strip()]
@@ -577,36 +646,34 @@ if resume_text.strip() and jd_text.strip():
 
             seen_terms, ordered_terms = set(), []
             for t in (ranked + gaps):
-                c = _canon(t)
+                c = _canon_local3(t)
                 if c and c not in seen_terms:
                     seen_terms.add(c); ordered_terms.append(t)
 
-            # Variants map
             variants_map = {}
             for it in (kw_obj_now.get("keywords") or []):
                 term = (it.get("term") or "").strip()
                 if term:
-                    variants_map[_canon(term)] = [v.strip() for v in (it.get("variants") or []) if v and v.strip()]
+                    variants_map[_canon_local3(term)] = [v.strip() for v in (it.get("variants") or []) if v and v.strip()]
 
             final_tokens = [t.lower() for t in token_re.findall(final_text)]
             final_compact = "".join(final_tokens)
 
-            def _tok_seq(s: str):
+            def _tok_seq3(s: str):
                 return [t.lower() for t in token_re.findall(s or "")]
 
             present, missing, coverage = [], [], []
             for term in ordered_terms:
-                cand_list = [term] + (variants_map.get(_canon(term), []))
+                cand_list = [term] + (variants_map.get(_canon_local3(term), []))
                 found = False
                 found_pos = -1
                 found_len = 0
 
                 for cand in cand_list:
-                    tt = _tok_seq(cand)
+                    tt = _tok_seq3(cand)
                     if not tt:
                         continue
 
-                    # A) exact token-sequence match
                     L = len(tt)
                     for i in range(0, len(final_tokens) - L + 1):
                         if final_tokens[i:i+L] == tt:
@@ -615,13 +682,11 @@ if resume_text.strip() and jd_text.strip():
                     if found:
                         break
 
-                    # B) compacted form (CI/CD -> cicd)
                     t_comp = "".join(tt)
                     if t_comp and t_comp in final_compact:
                         found, found_pos, found_len = True, -1, L
                         break
 
-                    # C) single-word plural/singular toggle for simple drift (avoid short acronyms)
                     if L == 1 and len(tt[0]) > 3:
                         base = tt[0]
                         alt = base[:-1] if base.endswith("s") else base + "s"
@@ -630,7 +695,6 @@ if resume_text.strip() and jd_text.strip():
                             break
 
                 if found:
-                    # evidence (best-effort)
                     if found_pos >= 0:
                         spans = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-z0-9#+.]+", final_text)]
                         s = spans[found_pos][1] if 0 <= found_pos < len(spans) else 0
@@ -639,7 +703,7 @@ if resume_text.strip() and jd_text.strip():
                         s = max(0, s - 20); e = min(len(final_text), e + 20)
                         ev = final_text[s:e].replace("\n", " ").strip()
                     else:
-                        ev = ""  # compact/toggled match; snippet not locatable
+                        ev = ""
                     present.append(term)
                     coverage.append({"term": term, "present": True, "evidence": ev})
                 else:
@@ -661,7 +725,7 @@ if resume_text.strip() and jd_text.strip():
     if ats_llm:
         c1, c2 = st.columns([1, 2])
         with c1:
-            st.metric("AI ATS Keyword Score", f"{ats_llm.get('score',0)}%")
+            st.metric("AI ATS Keyword Score", f"{ats_llm.get("score",0)}%")
         with c2:
             st.write("Suggestions (where & how to add missing keywords):")
             sugg = ats_llm.get("suggestions") or []
@@ -693,25 +757,5 @@ if resume_text.strip() and jd_text.strip():
                 ev = row.get("evidence","")
                 st.write(f"{p} {t}: {ev}")
 
-    # -----------------
-    # Export (Saved text only)
-    # -----------------
-    colx1, colx2 = st.columns(2)
-    with colx1:
-        saved_text = (st.session_state.get("tailored_text", "") or "").strip()
-        if st.session_state.get("tailored_saved") and saved_text and st.button("⬇️ Export DOCX"):
-            out_path = export_docx(saved_text, "tailored_resume.docx")
-            with open(out_path, "rb") as f:
-                st.download_button("Download DOCX", f, file_name="tailored_resume.docx")
-        elif not st.session_state.get("tailored_saved"):
-            st.info("Edit the text and click Save before exporting DOCX.")
-    with colx2:
-        saved_text = (st.session_state.get("tailored_text", "") or "").strip()
-        if st.session_state.get("tailored_saved") and saved_text and st.button("⬇️ Export PDF (professional)"):
-            out_path = export_pdf(saved_text, "tailored_resume.pdf")
-            with open(out_path, "rb") as f:
-                st.download_button("Download PDF", f, file_name="tailored_resume.pdf")
-        elif not st.session_state.get("tailored_saved"):
-            st.info("Edit the text and click Save before exporting PDF.")
 else:
     st.info("Upload or paste both the Resume and the Job Description to begin.")

@@ -43,11 +43,81 @@ def extract_contacts_regex(text: str) -> Dict[str,str]:
     }
 
 def sanitize_markdown(md: str) -> str:
-    md = md.replace("**", "")
-    md = md.replace("\t", " ")
-    md = re.sub(r"[ ]{3,}", "  ", md)
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
+    """
+    Post-format the model output so it looks clean & professional:
+    - collapse >2 blank lines to a single blank line
+    - ensure a blank line after known section headings
+    - normalize bullet markers to '• ' where a bullet already exists
+    - trim trailing/leading spaces
+    - remove stray markdown markers like '**'
+    """
+    import re
+
+    KNOWN_HEADINGS = {
+        "profile summary", "summary", "core skills", "core competencies",
+        "technical skills", "work experience", "experience",
+        "education", "certifications", "projects", "other"
+    }
+
+    # basic cleanup
+    md = (md or "").replace("**", "").replace("\t", " ")
+    md = re.sub(r"[ ]{3,}", "  ", md)          # 3+ spaces -> 2
+    md = re.sub(r"\r\n?", "\n", md)            # CRLF -> LF
+    md = re.sub(r"\n{3,}", "\n\n", md)         # 3+ newlines -> 2
+
+    lines = [ln.rstrip() for ln in md.split("\n")]
+    out = []
+    prev_blank = True
+
+    def is_heading(s: str) -> bool:
+        t = s.strip().lower()
+        return t in KNOWN_HEADINGS
+
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+
+        # normalize bullets that already look like bullets
+        if re.match(r"^[-•▪‣·*]\s+", s):
+            s = "• " + re.sub(r"^[-•▪‣·*]\s+", "", s)
+
+        out.append(s)
+
+        # ensure exactly one blank line after a recognized heading
+        if is_heading(s):
+            out.append("")  # add one blank line
+            prev_blank = True
+            # skip next auto-blank collapsing for this injected blank
+            continue
+
+        # collapse consecutive blank lines to max one
+        if s == "":
+            if prev_blank:
+                continue
+            prev_blank = True
+        else:
+            prev_blank = False
+
+    # remove leading/trailing blank lines
+    while out and out[0] == "":
+        out.pop(0)
+    while out and out[-1] == "":
+        out.pop()
+
+    # final collapse of multiple blanks
+    txt = "\n".join(out)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
+    """
+    Rewrites the generated keyword bullets to be sharper, resume-native, and ATS-friendly.
+    Keeps colon style and one-per-line format.
+    """
+    from ai.prompts import SYSTEM_KEYWORD_SENTENCES_POLISH, USER_KEYWORD_SENTENCES_POLISH
+    provider = _provider_from_keys(provider_pref, keys or {})
+    user = USER_KEYWORD_SENTENCES_POLISH.format(resume=resume_text or "", bullets=bullets_text or "", jd=jd_text or "")
+    out = provider.chat(model=model_name, system=SYSTEM_KEYWORD_SENTENCES_POLISH, user=user, temperature=temperature, max_tokens=min(max_tokens, 800))
+    return sanitize_markdown(out or "")
 
 def readability(text: str) -> Dict[str, float]:
     sentences = max(1, len(re.findall(r"[.!?]+", text)))
@@ -92,6 +162,32 @@ def extract_contacts_llm(resume_text: str, provider_pref: Optional[str], model_n
         return out
     except Exception:
         return extract_contacts_regex(resume_text)
+# -----------------------------
+# NEW: Polish keyword sentences helper
+# -----------------------------
+def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
+                             provider_pref: Optional[str], model_name: Optional[str],
+                             temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
+    """
+    Rewrites the generated keyword bullets to be sharper, resume-native, and ATS-friendly.
+    Keeps colon style and one-per-line format.
+    """
+    from ai.prompts import SYSTEM_KEYWORD_SENTENCES_POLISH, USER_KEYWORD_SENTENCES_POLISH
+    provider = _provider_from_keys(provider_pref, keys or {})
+    user = USER_KEYWORD_SENTENCES_POLISH.format(
+        resume=resume_text or "",
+        bullets=bullets_text or "",
+        jd=jd_text or ""
+    )
+    out = provider.chat(
+        model=model_name,
+        system=SYSTEM_KEYWORD_SENTENCES_POLISH,
+        user=user,
+        temperature=temperature,
+        max_tokens=min(max_tokens, 800)
+    )
+    return sanitize_markdown(out or "")
+
 
 def extract_keywords_llm(resume_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
