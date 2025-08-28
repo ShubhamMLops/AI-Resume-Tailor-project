@@ -1,17 +1,15 @@
-````markdown
 # 🚀 AI Resume Tailor (v8 Final)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-An intelligent **Streamlit** application that analyzes and tailors resumes against job descriptions using powerful AI models.  
+An intelligent **Streamlit** application that analyzes and tailors resumes against job descriptions using powerful AI models.
 This tool ensures your resume is **ATS-friendly**, **keyword-optimized**, and **professionally exportable** in both DOCX and PDF formats.
 
-
-
+---
 
 ## ✨ Why This Project?
 
-Tailoring a resume for every job can be repetitive and time-consuming.  
+Tailoring a resume for every job can be repetitive and time-consuming.
 This tool automates the process by combining **LLM intelligence** with ATS checks, ensuring your resume is always aligned with the target job description — **with Core Competencies enhanced automatically**.
 
 ---
@@ -19,54 +17,60 @@ This tool automates the process by combining **LLM intelligence** with ATS check
 ## 📋 Key Features
 
 ### 🔬 Analysis & Insights
-- **Contact Extraction**: Auto-detects name, email, phone, LinkedIn, GitHub (regex + AI refinement).
-- **ATS Score**: AI-powered keyword coverage vs final resume.
-- **Readability (FRE)**: Evaluates readability using the Flesch Reading Ease score.
-- **Warnings & Gaps**: Flags issues like short resumes, first-person pronouns, or missing keywords.
-- **Domain-Aware Keyword Extraction**: Detects role/domain, then extracts **tools, frameworks, and languages** tailored to that job.
+
+* **Contact Extraction**: Auto-detects name, email, phone, LinkedIn, GitHub (regex + AI refinement).
+* **ATS Score**: AI-powered keyword coverage vs final resume.
+* **Readability (FRE)**: Evaluates readability using the Flesch Reading Ease score.
+* **Warnings & Gaps**: Flags issues like short resumes, first-person pronouns, or missing keywords.
+* **Domain-Aware Keyword Extraction**: Detects role/domain, then extracts **tools, frameworks, and languages** tailored to that job.
 
 ### 🧩 Keyword Sentence Generator (ATS-Friendly)
-- Generates **Core Competencies–only** keyword sentences.  
-- Uses **Top Keywords (ranked) + Gaps**, compares with resume, and generates only new/needed bullets.  
-- Sentences are **technically accurate**, **contextually relevant**, and **ATS-optimized**.  
-- Fully editable before integration, with a **Save** option.
+
+* Generates **Core Competencies–only** keyword sentences.
+* Uses **Top Keywords (ranked) + Gaps**, compares with resume, and generates only new/needed bullets.
+* Sentences are **technically accurate**, **contextually relevant**, and **ATS-optimized**.
+* Fully editable before integration, with a **Save** option.
 
 ### 🤖 AI-Powered Tailoring
-- **Multiple Backends**: Works with **Google Gemini**, **OpenAI GPT**, and **Anthropic Claude**.
-- **Resume Integration**: Blends your resume + saved keyword sentences seamlessly, avoiding duplication.
-- **Strict Expert Guidance**: AI behaves like a professional resume writer, ensuring output looks **native, structured, and polished**.
+
+* **Multiple Backends**: Works with **Google Gemini**, **OpenAI GPT**, and **Anthropic Claude**.
+* **Resume Integration**: Blends your resume + saved keyword sentences seamlessly, avoiding duplication.
+* **Strict Expert Guidance**: AI behaves like a professional resume writer, ensuring output looks **native, structured, and polished**.
 
 ### 📄 Professional Document Export
-- **DOCX Export**: Clean, editable `.docx` with colored section headings.
-- **PDF Export**: High-quality `.pdf` with consistent formatting.
-- **Consistent Styling**: Headings in **#1F4E79** (deep blue), bullets as `•`.
+
+* **DOCX Export**: Clean, editable `.docx` with colored section headings.
+* **PDF Export**: High-quality `.pdf` with consistent formatting.
+* **Consistent Styling**: Headings in **#1F4E79** (deep blue), bullets as `•`.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Frontend**: [Streamlit](https://streamlit.io/)  
-- **Backend**: Python  
-- **DOCX Generation**: `python-docx`  
-- **PDF Generation**: `reportlab`  
-- **AI Models**: `openai`, `google-generativeai`, `anthropic`  
-- **Text Parsing**: `pdfminer.six`, `PyPDF2`  
+* **Frontend**: [Streamlit](https://streamlit.io/)
+* **Backend**: Python
+* **DOCX Generation**: `python-docx`
+* **PDF Generation**: `reportlab`
+* **AI Models**: `openai`, `google-generativeai`, `anthropic`
+* **Text Parsing**: `pdfminer.six`, `PyPDF2`
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Python **3.9+**
-- At least one API key (Gemini, OpenAI, or Anthropic)
+
+* Python **3.9+**
+* At least one API key (Gemini, OpenAI, or Anthropic)
 
 ### Installation
 
 1. Clone the repository:
+
    ```bash
    git clone https://github.com/your-username/ai-resume-tailor-v8-final.git
    cd ai-resume-tailor-v8-final
-````
+   ```
 
 2. Create and activate a virtual environment:
 
@@ -140,10 +144,3 @@ To contribute:
 ## 📜 License
 
 This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
-
-```
-
----
-
-Would you like me to also **add screenshots section** (with placeholders) in this README so that later you just drop `.png` files in a `/screenshots` folder and link them? That way your repo looks even more polished.
-```
