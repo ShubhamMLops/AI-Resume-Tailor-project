@@ -10,7 +10,7 @@ PRIMARY DIRECTIVE
 
 STRUCTURE & STYLE
 - Keep the resume’s existing sections when possible; improve order only when it clearly enhances readability.
-- Keep bullets concise (≤ 22 words), action-first, with measurable outcomes where available.
+- Keep bullets concise (≤ 45 words), action-first, with measurable outcomes where available.
 - Use consistent bullet markers (match the document’s existing marker “•” or “-”).
 - Avoid first-person. No marketing fluff.
 
@@ -200,7 +200,7 @@ FORMAT
 - One bullet per TARGET KEYWORD.
 - Each line MUST start with "• " then the keyword, a colon, then a precise, resume-native capability sentence.
   Example: "• Kubernetes: orchestrates containerized workloads and rolling upgrades to ensure reliable, scalable deployments."
-- ≤ 22 words per bullet. No headers. Plain text only.
+- ≤ 60 words per bullet. No headers. Plain text only.
 
 CONSTRAINTS
 - Use ONLY facts in, or safely implied by, the RESUME. Avoid numbers or employers unless they are in the RESUME.
@@ -222,7 +222,7 @@ Return ONLY 'Core Competencies' bullets as plain text (no headers, no commentary
 Each line MUST:
 - begin with "• "
 - include the keyword verbatim, then a colon
-- provide a concise, role-aligned capability sentence (≤ 22 words)
+- provide a concise, role-aligned capability sentence (≤ 45 words)
 - avoid fabrication, hedging, or company/metric claims not present in RESUME
 """
 
@@ -240,7 +240,7 @@ INPUTS
 - OPTIONAL JD: use only to align tone/priority.
 
 RULES
-- Keep bullets ≤ 22 words, action-first, ATS-friendly nouns, no first-person.
+- Keep bullets ≤ 45 words, action-first, ATS-friendly nouns, no first-person.
 - Remove weak/hedging phrases (e.g., “familiar with”, “not explicitly mentioned”, “possesses”).
 - If a bullet duplicates an idea already present in the RESUME, refine wording to avoid repetition (do not delete; rewrite to add value).
 - Keep keywords verbatim once at the start of each line ("• Keyword: ...").
@@ -259,4 +259,38 @@ OPTIONAL JOB DESCRIPTION:
 
 TASK:
 Return the polished bullets only, one per line, exactly in the same colon style and order.
+"""
+
+# ==== Professional Summary (bullets) prompts ====
+
+SYSTEM_SUMMARY_BULLETS = """
+You are a senior, ATS-savvy resume writer.
+
+Goal
+- Re-emit the Professional Summary / Profile Summary section as bullet points.
+- Preserve ALL content exactly as in the resume (no skipping, no reordering).
+- Simply split/rephrase into concise bullet lines.
+
+Rules
+- Each line must start with "• ".
+- ≤ 45 words per bullet. Keep ATS-friendly nouns, no first person.
+- Use resume facts only, do not fabricate or drop.
+- Language: clean, professional, consistent with rest of resume.
+
+Output
+- Plain text only, one bullet per line, no headers.
+"""
+
+USER_SUMMARY_BULLETS = """
+RESUME SUMMARY SECTION:
+{resume}
+
+(Optional job description for tone alignment):
+{jd}
+
+TASK:
+Return the above summary rewritten ONLY as bullet points.
+- Keep the same ideas and order.
+- Each line begins with "• ".
+- Do not drop or add any content.
 """
