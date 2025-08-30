@@ -700,21 +700,27 @@ if resume_text.strip() and jd_text.strip():
 
                 final_txt = sanitize_markdown(tailored)
 
-                # --- Role-aligned bullet Summary via LLM (uses JD for tone/precision) ---
+                
+                # --- Role-aligned bullet Summary via LLM ---
                 if has_summary and orig_summary_block.strip():
-                    # Use LLM that aligns wording to role, but stays within resume facts
                     bullets_text = generate_summary_bullets(
                         resume_text=orig_summary_block,   # only the original summary text
-                        jd_text=jd_text,                  # let LLM tighten wording toward the role
+                        jd_text=jd_text,                  # align wording to the role
                         focus="summary",
                         provider_pref=provider,
                         model_name=(model or None),
                         temperature=temperature,
-                        max_tokens=min(max_tokens, 600),
+                        max_tokens=min(max_tokens, 1000),  # allow longer bullets
                         keys=keys,
                     )
                     if bullets_text:
                         final_txt = _replace_placeholders_with_bullets(final_txt, bullets_text)
+                # --- Replace Core Competencies with polished Keyword Sentences ---
+                saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
+                if saved_kw_sentences:
+                    from pipeline import replace_core_competencies
+                    final_txt = replace_core_competencies(final_txt, saved_kw_sentences)
+
                 # Remove any leftover placeholders just in case
                 final_txt = final_txt.replace(_SUMMARY_START_PH, "\n").replace(_SUMMARY_END_PH, "\n")
 
@@ -916,3 +922,4 @@ if resume_text.strip() and jd_text.strip():
 
 else:
     st.info("Upload or paste both the Resume and the Job Description to begin.")
+

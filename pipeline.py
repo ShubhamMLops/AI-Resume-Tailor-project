@@ -432,6 +432,47 @@ github={contacts.get('github','')}"""
     )
     return sanitize_markdown(out)
 
+def replace_core_competencies(full_text: str, new_bullets: str) -> str:
+    """
+    Replace the 'Core Competencies' section body with provided bullets.
+    If section doesn't exist, append it before Technical Skills or at the end.
+    """
+    new_bullets = (new_bullets or "").strip()
+    if not new_bullets:
+        return full_text
+
+    # Normalize bullets
+    lines = []
+    for ln in new_bullets.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith("• "):
+            s = "• " + s.lstrip("-• ").strip()
+        lines.append(s)
+    block = "\n".join(lines)
+
+    # Find Core Competencies section
+    pattern = re.compile(r"(?im)^(core\s*competencies)\s*[:\-–—]?\s*$")
+    m = pattern.search(full_text or "")
+    if m:
+        head = full_text[:m.end()]
+        after = full_text[m.end():]
+        nxt = re.search(
+            r"(?im)^\s*(skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$",
+            after
+        )
+        section_end = m.end() + (nxt.start() if nxt else len(after))
+        tail = full_text[section_end:]
+        return (head + "\n" + block + "\n\n" + tail).strip()
+    else:
+        # If not found, add before Technical Skills or at end
+        insertion_point = re.search(r"(?im)^\s*(technical\s*skills)\s*[:\-–—]?\s*$", full_text or "")
+        if insertion_point:
+            idx = insertion_point.start()
+            return full_text[:idx] + "\nCore Competencies\n" + block + "\n\n" + full_text[idx:]
+        return full_text.rstrip() + "\n\nCore Competencies\n" + block
+
 # -----------------------------
 # AI ATS: read final resume + optimizer JSON
 # -----------------------------
@@ -497,3 +538,4 @@ def extract_ats_llm_from_optimizer(
             })
     obj["suggestions"] = fixed_sugg
     return obj
+
