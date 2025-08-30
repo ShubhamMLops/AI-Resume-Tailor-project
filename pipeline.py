@@ -1,23 +1,31 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional, List
 import re, json
+from ai.prompts import SYSTEM_SUMMARY_BULLETS, USER_SUMMARY_BULLETS
 from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
-from ai.prompts import SYSTEM_KEYWORD_SENTENCES, USER_KEYWORD_SENTENCES
 from ai.prompts import (
     SYSTEM_TAILOR, USER_TAILOR,
     SYSTEM_KEYWORDS, USER_KEYWORDS,
     SYSTEM_SAMPLE_RESUME, USER_SAMPLE_RESUME,
     SYSTEM_TAILOR_JSON, USER_TAILOR_JSON,
     SYSTEM_CONTACTS, USER_CONTACTS,
-    SYSTEM_ATS, USER_ATS,  # <-- ATS prompts
+    SYSTEM_SUMMARY_BULLETS, USER_SUMMARY_BULLETS,
+    SYSTEM_ATS, USER_ATS,
+    SYSTEM_KEYWORD_SENTENCES, USER_KEYWORD_SENTENCES,
 )
 
+# -----------------------------
+# Regex helpers
+# -----------------------------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:\+\d{1,3}[\s-]?)?\b(?:\d[\s-]?){8,14}\b")
 LINKEDIN_RE = re.compile(r"(https?://)?(www\.)?linkedin\.com/[^\s\)\]]+", re.I)
 GITHUB_RE = re.compile(r"(https?://)?(www\.)?github\.com/[^\s\)\]]+", re.I)
 
+# -----------------------------
+# Contacts
+# -----------------------------
 def extract_contacts_regex(text: str) -> Dict[str,str]:
     email = EMAIL_RE.search(text)
     phone = PHONE_RE.search(text)
@@ -42,28 +50,42 @@ def extract_contacts_regex(text: str) -> Dict[str,str]:
         "github": github.group(0) if github else "",
     }
 
+def extract_contacts_llm(resume_text: str, provider_pref: Optional[str], model_name: Optional[str], keys: Dict[str,str]) -> Dict[str,str]:
+    provider = _provider_from_keys(provider_pref, keys)
+    raw = provider.chat(model=model_name, system=SYSTEM_CONTACTS, user=USER_CONTACTS.format(resume=resume_text), temperature=0, max_tokens=256)
+    raw = (raw or "").strip().strip('`').strip()
+    try:
+        start = raw.find('{'); end = raw.rfind('}') + 1
+        obj = json.loads(raw[start:end])
+        out = {k: (obj.get(k) or "") for k in ["name","email","phone","linkedin","github"]}
+        return out
+    except Exception:
+        return extract_contacts_regex(resume_text)
+
+# -----------------------------
+# Sanitizer
+# -----------------------------
 def sanitize_markdown(md: str) -> str:
     """
     Post-format the model output so it looks clean & professional:
     - collapse >2 blank lines to a single blank line
     - ensure a blank line after known section headings
     - normalize bullet markers to '• ' where a bullet already exists
-    - trim trailing/leading spaces
-    - remove stray markdown markers like '**'
+    - trim trailing/leading spaces; remove stray markdown markers
     """
     import re
 
     KNOWN_HEADINGS = {
-        "profile summary", "summary", "core skills", "core competencies",
+        "profile summary", "professional summary", "summary",
+        "core skills", "core competencies",
         "technical skills", "work experience", "experience",
         "education", "certifications", "projects", "other"
     }
 
-    # basic cleanup
     md = (md or "").replace("**", "").replace("\t", " ")
-    md = re.sub(r"[ ]{3,}", "  ", md)          # 3+ spaces -> 2
-    md = re.sub(r"\r\n?", "\n", md)            # CRLF -> LF
-    md = re.sub(r"\n{3,}", "\n\n", md)         # 3+ newlines -> 2
+    md = re.sub(r"[ ]{3,}", "  ", md)
+    md = re.sub(r"\r\n?", "\n", md)
+    md = re.sub(r"\n{3,}", "\n\n", md)
 
     lines = [ln.rstrip() for ln in md.split("\n")]
     out = []
@@ -73,23 +95,20 @@ def sanitize_markdown(md: str) -> str:
         t = s.strip().lower()
         return t in KNOWN_HEADINGS
 
-    for i, raw in enumerate(lines):
+    for raw in lines:
         s = raw.strip()
 
-        # normalize bullets that already look like bullets
+        # normalize bullets
         if re.match(r"^[-•▪‣·*]\s+", s):
             s = "• " + re.sub(r"^[-•▪‣·*]\s+", "", s)
 
         out.append(s)
 
-        # ensure exactly one blank line after a recognized heading
         if is_heading(s):
-            out.append("")  # add one blank line
+            out.append("")  # force single blank line after heading
             prev_blank = True
-            # skip next auto-blank collapsing for this injected blank
             continue
 
-        # collapse consecutive blank lines to max one
         if s == "":
             if prev_blank:
                 continue
@@ -97,28 +116,27 @@ def sanitize_markdown(md: str) -> str:
         else:
             prev_blank = False
 
-    # remove leading/trailing blank lines
     while out and out[0] == "":
         out.pop(0)
     while out and out[-1] == "":
         out.pop()
 
-    # final collapse of multiple blanks
     txt = "\n".join(out)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     return txt.strip()
 
-def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
-    """
-    Rewrites the generated keyword bullets to be sharper, resume-native, and ATS-friendly.
-    Keeps colon style and one-per-line format.
-    """
-    from ai.prompts import SYSTEM_KEYWORD_SENTENCES_POLISH, USER_KEYWORD_SENTENCES_POLISH
-    provider = _provider_from_keys(provider_pref, keys or {})
-    user = USER_KEYWORD_SENTENCES_POLISH.format(resume=resume_text or "", bullets=bullets_text or "", jd=jd_text or "")
-    out = provider.chat(model=model_name, system=SYSTEM_KEYWORD_SENTENCES_POLISH, user=user, temperature=temperature, max_tokens=min(max_tokens, 800))
-    return sanitize_markdown(out or "")
+# -----------------------------
+# Provider selector
+# -----------------------------
+def _provider_from_keys(provider_preference: Optional[str], keys: Dict[str,str]):
+    provider = get_provider(provider_preference, keys)
+    if not provider:
+        raise RuntimeError("No API key provided in the app. Enter a key in the sidebar.")
+    return provider
 
+# -----------------------------
+# Analysis
+# -----------------------------
 def readability(text: str) -> Dict[str, float]:
     sentences = max(1, len(re.findall(r"[.!?]+", text)))
     words = re.findall(r"[A-Za-z0-9']+", text)
@@ -145,31 +163,57 @@ def analyze(resume_text: str, jd_text: str) -> Dict[str, Any]:
     report["contacts"] = extract_contacts_regex(resume_text)
     return report
 
-def _provider_from_keys(provider_preference: Optional[str], keys: Dict[str,str]):
-    provider = get_provider(provider_preference, keys)
-    if not provider:
-        raise RuntimeError("No API key provided in the app. Enter a key in the sidebar.")
-    return provider
-
-def extract_contacts_llm(resume_text: str, provider_pref: Optional[str], model_name: Optional[str], keys: Dict[str,str]) -> Dict[str,str]:
+# -----------------------------
+# Keywords (LLM)
+# -----------------------------
+def extract_keywords_llm(resume_text: str, jd_text: str,
+                         provider_pref: Optional[str], model_name: Optional[str],
+                         temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
-    raw = provider.chat(model=model_name, system=SYSTEM_CONTACTS, user=USER_CONTACTS.format(resume=resume_text), temperature=0, max_tokens=256)
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_KEYWORDS,
+        user=USER_KEYWORDS.format(jd=jd_text, resume=resume_text),
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
     raw = (raw or "").strip().strip('`').strip()
     try:
         start = raw.find('{'); end = raw.rfind('}') + 1
         obj = json.loads(raw[start:end])
-        out = {k: (obj.get(k) or "") for k in ["name","email","phone","linkedin","github"]}
-        return out
     except Exception:
-        return extract_contacts_regex(resume_text)
+        obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
+    return obj
+
 # -----------------------------
-# NEW: Polish keyword sentences helper
+# Keyword sentences (Core Competencies only)
+# -----------------------------
+def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: List[str],
+                               provider_pref: Optional[str], model_name: Optional[str],
+                               temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
+    """
+    Ask the LLM to produce ATS-friendly Core Competencies bullets for the provided keywords.
+    Returns plain text (one '• ' bullet per line).
+    """
+    provider = _provider_from_keys(provider_pref, keys or {})
+    kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
+    resp = provider.chat(
+        model=model_name,
+        system=SYSTEM_KEYWORD_SENTENCES,
+        user=USER_KEYWORD_SENTENCES.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    return sanitize_markdown(resp or "").strip()
+
+# -----------------------------
+# Polish keyword sentences
 # -----------------------------
 def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
                              provider_pref: Optional[str], model_name: Optional[str],
                              temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
     """
-    Rewrites the generated keyword bullets to be sharper, resume-native, and ATS-friendly.
+    Rewrites generated keyword bullets to be sharper, resume-native, and ATS-friendly.
     Keeps colon style and one-per-line format.
     """
     from ai.prompts import SYSTEM_KEYWORD_SENTENCES_POLISH, USER_KEYWORD_SENTENCES_POLISH
@@ -188,18 +232,101 @@ def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
     )
     return sanitize_markdown(out or "")
 
+def polish_core_competencies(
+    original_bullets: str,
+    new_bullets: str,
+    provider_pref: Optional[str],
+    model_name: Optional[str],
+    temperature: float,
+    max_tokens: int,
+    keys: Dict[str, str],
+) -> str:
+    """
+    Merge original + new Core Competencies and polish them into a unified ATS-friendly bullet list.
+    Keeps ALL items exactly, no additions or removals.
+    """
+    from ai.prompts import SYSTEM_CORE_COMPETENCIES_POLISH, USER_CORE_COMPETENCIES_POLISH
+    provider = _provider_from_keys(provider_pref, keys or {})
+    user = USER_CORE_COMPETENCIES_POLISH.format(
+        original=original_bullets or "",
+        new=new_bullets or "",
+    )
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_CORE_COMPETENCIES_POLISH,
+        user=user,
+        temperature=temperature,
+        max_tokens=min(max_tokens, 900),
+    )
+    return sanitize_markdown(raw or "").strip()
 
-def extract_keywords_llm(resume_text: str, jd_text: str, provider_pref: Optional[str], model_name: Optional[str], temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
-    provider = _provider_from_keys(provider_pref, keys)
-    raw = provider.chat(model=model_name, system=SYSTEM_KEYWORDS, user=USER_KEYWORDS.format(jd=jd_text, resume=resume_text), temperature=temperature, max_tokens=max_tokens)
-    raw = (raw or "").strip().strip('`').strip()
-    try:
-        start = raw.find('{'); end = raw.rfind('}') + 1
-        obj = json.loads(raw[start:end])
-    except Exception:
-        obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
-    return obj
 
+
+# -----------------------------
+# Summary bullets (Profile/Professional)
+# -----------------------------
+def generate_summary_bullets(
+    resume_text: str,
+    jd_text: str,
+    focus: str,
+    provider_pref: Optional[str],
+    model_name: Optional[str],
+    temperature: float,
+    max_tokens: int,
+    keys: Dict[str, str],
+) -> str:
+    """
+    Generate a professional summary as bullet points (• …) using only resume facts,
+    aligned to the JD. No hard cap here; model should avoid redundancy.
+    """
+    provider = _provider_from_keys(provider_pref, keys or {})
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_SUMMARY_BULLETS,
+        user=USER_SUMMARY_BULLETS.format(jd=jd_text, resume=resume_text, focus=(focus or "")),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return sanitize_markdown(raw or "").strip()
+
+# --- Summary bulletizer (preserve meaning & order) ---
+def bulletize_summary_preserve_meaning(
+    summary_text: str,
+    provider_pref: Optional[str],
+    model_name: Optional[str],
+    temperature: float,
+    max_tokens: int,
+    keys: Dict[str, str],
+) -> str:
+    """
+    Re-emit the ORIGINAL Summary as bullets:
+    - preserves content & order (no new facts)
+    - each line starts with '• '
+    - plain text only
+    """
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        return ""
+
+    provider = _provider_from_keys(provider_pref, keys or {})
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_SUMMARY_BULLETS,                       # <-- use existing prompts
+        user=USER_SUMMARY_BULLETS.format(
+            jd="",                                          # we don't need JD here; we are preserving content
+            resume=summary_text,                            # pass ONLY the extracted summary body
+            focus=""                                        # keep empty; template tolerates it
+        ),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return sanitize_markdown(raw or "").strip()
+
+
+
+# -----------------------------
+# Render JSON -> text (used by tailoring JSON path)
+# -----------------------------
 def _limit_words(s: str, max_words: int = 22) -> str:
     parts = s.split()
     return s if len(parts)<=max_words else " ".join(parts[:max_words])
@@ -293,25 +420,14 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
 
     return sanitize_markdown("\n".join(lines))
 
-def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: list,
-                               provider_pref: Optional[str], model_name: Optional[str],
-                               temperature: float, max_tokens: int, keys: Dict[str,str]) -> str:
-    """
-    Ask the LLM to produce ATS-friendly bullets that integrate the provided target keywords.
-    Returns plain text (one '• ' bullet per line).
-    """
-    provider = _provider_from_keys(provider_pref, keys or {})
-    kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
-    resp = provider.chat(
-        model=model_name,
-        system=SYSTEM_KEYWORD_SENTENCES,
-        user=USER_KEYWORD_SENTENCES.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
-    return sanitize_markdown(resp or "").strip()
-
-def tailor(resume_text: str, jd_text: str, provider_preference: str = None, model_name: str = None, temperature: float = 0.2, max_tokens: int = 1500, keys: Dict[str,str] = None, target_keywords: Optional[List[str]] = None, override_contacts: Optional[Dict[str,str]] = None) -> str:
+# -----------------------------
+# Tailor (JSON-first, fallback to text)
+# -----------------------------
+def tailor(resume_text: str, jd_text: str,
+           provider_preference: str = None, model_name: str = None,
+           temperature: float = 0.2, max_tokens: int = 1500,
+           keys: Dict[str,str] = None, target_keywords: Optional[List[str]] = None,
+           override_contacts: Optional[Dict[str,str]] = None) -> str:
     provider = _provider_from_keys(provider_preference, keys or {})
     kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
     contacts = override_contacts if override_contacts is not None else extract_contacts_regex(resume_text)
@@ -337,11 +453,58 @@ github={contacts.get('github','')}"""
     except Exception:
         pass
 
-    out = provider.chat(model=model_name, system=SYSTEM_TAILOR, user=USER_TAILOR.format(jd=jd_text, resume=resume_text, keywords=kw_blob), temperature=temperature, max_tokens=max_tokens)
+    out = provider.chat(
+        model=model_name,
+        system=SYSTEM_TAILOR,
+        user=USER_TAILOR.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
     return sanitize_markdown(out)
 
+def replace_core_competencies(full_text: str, new_bullets: str) -> str:
+    """
+    Replace the 'Core Competencies' section body with provided bullets.
+    If section doesn't exist, append it before Technical Skills or at the end.
+    """
+    new_bullets = (new_bullets or "").strip()
+    if not new_bullets:
+        return full_text
+
+    # Normalize bullets
+    lines = []
+    for ln in new_bullets.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith("• "):
+            s = "• " + s.lstrip("-• ").strip()
+        lines.append(s)
+    block = "\n".join(lines)
+
+    # Find Core Competencies section
+    pattern = re.compile(r"(?im)^(core\s*competencies)\s*[:\-–—]?\s*$")
+    m = pattern.search(full_text or "")
+    if m:
+        head = full_text[:m.end()]
+        after = full_text[m.end():]
+        nxt = re.search(
+            r"(?im)^\s*(skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$",
+            after
+        )
+        section_end = m.end() + (nxt.start() if nxt else len(after))
+        tail = full_text[section_end:]
+        return (head + "\n" + block + "\n\n" + tail).strip()
+    else:
+        # If not found, add before Technical Skills or at end
+        insertion_point = re.search(r"(?im)^\s*(technical\s*skills)\s*[:\-–—]?\s*$", full_text or "")
+        if insertion_point:
+            idx = insertion_point.start()
+            return full_text[:idx] + "\nCore Competencies\n" + block + "\n\n" + full_text[idx:]
+        return full_text.rstrip() + "\n\nCore Competencies\n" + block
+
 # -----------------------------
-# AI ATS: read final resume + optimizer JSON, return strict JSON
+# AI ATS: read final resume + optimizer JSON
 # -----------------------------
 def extract_ats_llm_from_optimizer(
     resume_text: str,
@@ -405,3 +568,4 @@ def extract_ats_llm_from_optimizer(
             })
     obj["suggestions"] = fixed_sugg
     return obj
+
