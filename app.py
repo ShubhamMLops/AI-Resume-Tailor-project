@@ -167,6 +167,34 @@ def _extract_existing_summary_block(resume_text: str) -> str:
         return after[:n.start()].strip()
     return after.strip()
 
+def _extract_core_competencies_block(text: str) -> str:
+    """
+    Extract the body of the Core Competencies section (excluding heading).
+    Handles variations like 'CORE COMPETENCIES:', 'Core-Competencies', etc.
+    """
+    if not text:
+        return ""
+
+    # Match heading in multiple variations
+    pattern = re.compile(r"(?im)^\s*core[\s\-_:]*competencies\s*[:\-–—]?\s*$")
+    m = pattern.search(text)
+    if not m:
+        return ""
+
+    after = text[m.end():]
+
+    # Look for the next section heading
+    nxt = re.search(
+        r"(?im)^\s*(skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications|summary)\s*[:\-–—]?\s*$",
+        after
+    )
+
+    section_text = after[:nxt.start()].strip() if nxt else after.strip()
+    return section_text
+
+
+
+
 def _replace_summary_with_bullets(full_text: str, bullets_text: str) -> str:
     """
     Replace the first 'Profile Summary'/'Professional Summary' block with the new bullets.
@@ -679,9 +707,13 @@ if resume_text.strip() and jd_text.strip():
                 orig_summary_block = _extract_existing_summary_block(resume_text)
                 resume_frozen, has_summary = _insert_summary_placeholders(base_resume_for_llm)
 
-                # Strengthen the instruction to the model in the integration notes (already appended above):
+                # Strengthen the instruction to the model in the integration notes
                 if "Integration Notes (for model):" in resume_frozen:
-                    resume_frozen += "\n- DO NOT move or delete the markers '<<<KEEP_SUMMARY_POSITION_START>>>' and '<<<KEEP_SUMMARY_POSITION_END>>>'.\n- Keep the exact section order as provided."
+                    resume_frozen += (
+                        "\n- DO NOT move or delete the markers '<<<KEEP_SUMMARY_POSITION_START>>>' "
+                        "and '<<<KEEP_SUMMARY_POSITION_END>>>'."
+                        "\n- Keep the exact section order as provided."
+                    )
 
                 override_contacts = st.session_state.get("override_contacts")
 
@@ -715,14 +747,30 @@ if resume_text.strip() and jd_text.strip():
                     )
                     if bullets_text:
                         final_txt = _replace_placeholders_with_bullets(final_txt, bullets_text)
-                # --- Replace Core Competencies with polished Keyword Sentences ---
-                saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
-                if saved_kw_sentences:
-                    from pipeline import replace_core_competencies
-                    final_txt = replace_core_competencies(final_txt, saved_kw_sentences)
 
                 # Remove any leftover placeholders just in case
                 final_txt = final_txt.replace(_SUMMARY_START_PH, "\n").replace(_SUMMARY_END_PH, "\n")
+
+                # --- Strict Core Competencies (merge + polish) ---
+                saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
+                orig_core_block = _extract_core_competencies_block(resume_text)
+                st.write("🔍 Extracted Core Competencies from resume:", orig_core_block)   # <--- ADD HERE
+
+                if orig_core_block or saved_kw_sentences:
+                    from pipeline import polish_core_competencies, replace_core_competencies
+                    polished_core = polish_core_competencies(
+                        original_bullets=orig_core_block,
+                        new_bullets=saved_kw_sentences,
+                        provider_pref=provider,
+                        model_name=(model or None),
+                        temperature=temperature,
+                        max_tokens=min(max_tokens, 900),
+                        keys=keys,
+                    )
+                    if polished_core:
+                        final_txt = replace_core_competencies(final_txt, polished_core)
+
+
 
 
                 # Persist to editor

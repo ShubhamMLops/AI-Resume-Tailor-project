@@ -232,6 +232,36 @@ def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
     )
     return sanitize_markdown(out or "")
 
+def polish_core_competencies(
+    original_bullets: str,
+    new_bullets: str,
+    provider_pref: Optional[str],
+    model_name: Optional[str],
+    temperature: float,
+    max_tokens: int,
+    keys: Dict[str, str],
+) -> str:
+    """
+    Merge original + new Core Competencies and polish them into a unified ATS-friendly bullet list.
+    Keeps ALL items exactly, no additions or removals.
+    """
+    from ai.prompts import SYSTEM_CORE_COMPETENCIES_POLISH, USER_CORE_COMPETENCIES_POLISH
+    provider = _provider_from_keys(provider_pref, keys or {})
+    user = USER_CORE_COMPETENCIES_POLISH.format(
+        original=original_bullets or "",
+        new=new_bullets or "",
+    )
+    raw = provider.chat(
+        model=model_name,
+        system=SYSTEM_CORE_COMPETENCIES_POLISH,
+        user=user,
+        temperature=temperature,
+        max_tokens=min(max_tokens, 900),
+    )
+    return sanitize_markdown(raw or "").strip()
+
+
+
 # -----------------------------
 # Summary bullets (Profile/Professional)
 # -----------------------------

@@ -332,3 +332,39 @@ TASK:
 Rewrite the Core Competencies section using the style and tone of the Keyword Bullets.
 Return ONLY the rewritten bullets (plain text, one per line).
 """
+
+SYSTEM_CORE_COMPETENCIES_POLISH = """
+You are a strict ATS resume rewriting assistant.
+
+GOAL
+- Rewrite the Core Competencies bullets so they are ATS-friendly and professional.
+- Use ONLY the competencies provided (original + new).
+- Do NOT invent new skills or drop any given ones.
+
+RULES
+- Section title must remain 'Core Competencies'.
+- Each bullet must begin with "• Keyword: ..." (keyword first, then a concise capability statement).
+- ≤ 45 words per bullet.
+- Only rephrase style, do not change the set of competencies.
+- Output plain text only, one bullet per line, no headers or commentary.
+"""
+
+USER_CORE_COMPETENCIES_POLISH = """
+ORIGINAL CORE COMPETENCIES (from resume):
+{original}
+
+NEW KEYWORD BULLETS (from generator):
+{new}
+
+TASK:
+Rephrase ALL of the above bullets into a unified Core Competencies list:
+- Keep every bullet (do not drop any).
+- Do not add new ones.
+- Rewrite wording into colon-style, ATS-friendly format.
+- Output only the final bullets, one per line, starting with "• ".
+"""
+
+
+
+
+
