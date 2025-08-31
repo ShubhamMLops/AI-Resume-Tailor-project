@@ -175,12 +175,13 @@ def clean_keyword_output(obj: Dict[str, Any]) -> Dict[str, Any]:
     # Collect all terms already in keywords
     keyword_terms = { (item.get("term") or "").lower().strip() for item in obj.get("keywords", []) }
 
-    # Remove duplicates from missing
-    missing_terms = []
-    for t in obj.get("missing", []):
+    # Merge weak + missing into a single clean "gaps" list
+    gap_terms = []
+    for t in (obj.get("weak", []) or []) + (obj.get("missing", []) or []):
         if t and t.lower().strip() not in keyword_terms:
-            missing_terms.append(t)
-    obj["missing"] = missing_terms
+            gap_terms.append(t)
+    obj["gaps"] = sorted(set(gap_terms))
+
 
     # Normalize ranks (1..N)
     kws = obj.get("keywords", [])
@@ -208,18 +209,13 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
 
     raw = (raw or "").strip().strip("`").strip()
 
-    # 🔍 Debug raw output
     print("\n=== RAW LLM OUTPUT ===")
     print(raw)
     print("======================\n")
 
     try:
-        # extract only the JSON part from raw
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        cleaned = raw[start:end]
-
-        obj = json.loads(cleaned)
+        start = raw.find("{"); end = raw.rfind("}") + 1
+        obj = json.loads(raw[start:end])
     except Exception as e:
         obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
         obj["_parse_error"] = str(e)
@@ -234,34 +230,58 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
 
     # ✅ attach raw JSON for debug
     obj["_raw_json"] = raw
-    # ✅ enforce that all JD terms are captured
+
+    # ✅ enforce JD coverage (force-add any missing terms)
     obj = enforce_jd_keywords(obj, jd_text)
+    obj = enforce_jd_keywords(obj, jd_text, resume_text)
 
     return obj
 
 
-    
-
-
-
-def enforce_jd_keywords(obj, jd_text: str):
+def enforce_jd_keywords(obj, jd_text: str, resume_text: str = ""):
     """
-    Ensure no important JD keywords are missed.
-    If the LLM forgot them, force-add into 'missing'.
+    Ensure Gaps = Top Keywords (ranked) not found in resume.
+    Uses the same matching logic as keyword extraction.
     """
-    jd_terms = re.findall(r"\b[A-Z][A-Za-z0-9\+\-_/]{2,}\b", jd_text)  # crude: grabs AWS, SQL, Kubernetes, etc.
-    jd_terms = list(set(jd_terms))
 
-    present_terms = [item["term"].lower() for item in obj.get("keywords", [])]
-    missing_terms = set(obj.get("missing", []))
+    token_re = re.compile(r"[A-Za-z0-9#+./_-]+")
+    resume_tokens = [t.lower() for t in token_re.findall(resume_text or "")]
+    resume_compact = "".join(resume_tokens)
 
-    for t in jd_terms:
-        tl = t.lower()
-        if tl not in present_terms:
-            missing_terms.add(t)
+    def _present(term: str) -> bool:
+        kt = [t.lower() for t in token_re.findall(term or "")]
+        if not kt:
+            return False
+        L = len(kt)
+        for i in range(0, len(resume_tokens) - L + 1):
+            if resume_tokens[i:i+L] == kt:
+                return True
+        if "".join(kt) in resume_compact:
+            return True
+        if L == 1 and len(kt[0]) > 3:
+            base = kt[0]
+            alt = base[:-1] if base.endswith("s") else base + "s"
+            if base in resume_tokens or alt in resume_tokens:
+                return True
+        return False
 
+    missing_terms = set()
+
+    for item in obj.get("keywords", []):
+        term = (item.get("term") or "").strip()
+        if not term:
+            continue
+        variants = [term] + [v.strip() for v in (item.get("variants") or []) if v and v.strip()]
+
+        found = any(_present(v) for v in variants)
+        if not found:
+            missing_terms.add(term)
+
+    # 🔑 Gaps = these missing keywords
     obj["missing"] = sorted(missing_terms)
+
     return obj
+
 
 
 # -----------------------------

@@ -374,33 +374,31 @@ if resume_text.strip() and jd_text.strip():
 
 
     def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
-        missing_terms = []
+        """
+        Extract true skill gaps: tools/technologies from JD not already in Top Keywords.
+        No verbs or filler words.
+        """
+        gap_terms = []
         try:
-            bow_missing = [w for (w, _) in (report["keywords_bow"]["missing"] or [])]
-            seen = set()
-            for w in bow_missing:
-                wl = w.lower().strip()
-                if len(wl) > 2 and wl not in seen:
-                    seen.add(wl); missing_terms.append(w)
-            missing_terms = missing_terms[:20]
-        except Exception:
-            missing_terms = []
+            # Capture capitalized tech terms / acronyms from JD
+            jd_tokens = re.findall(r"\b[A-Z][A-Za-z0-9+\-_/]{2,}\b", jd_text)
+            jd_tokens = [t for t in jd_tokens if len(t) > 2]
 
-        weak_terms = []
-        try:
-            text_low = " " + " ".join(resume_text.lower().split()) + " "
-            terms = [(item.get("term") or "").strip() for item in (kw_obj.get("keywords") or [])]
-            seen2 = set()
-            for t in terms:
-                tl = t.lower()
-                if not tl or tl in seen2: continue
-                seen2.add(tl)
-                if text_low.count(" " + tl + " ") == 1:
-                    weak_terms.append(t)
-            weak_terms = weak_terms[:20]
+            # Already covered keywords
+            seen_keywords = { (item.get("term") or "").lower() for item in (kw_obj.get("keywords") or []) }
+
+            # Filter out those already present
+            gap_terms = [t for t in jd_tokens if t.lower() not in seen_keywords]
+
+            # Deduplicate and sort
+            gap_terms = sorted(set(gap_terms))
         except Exception:
-            weak_terms = []
-        return missing_terms, weak_terms
+            gap_terms = []
+
+        # Weak terms: keep existing logic (or leave empty if you don’t want it at all)
+        weak_terms = []
+        return gap_terms, weak_terms
+
 
     # Build target keywords from Optimizer (ranked + gaps), deduped, excluding ones already in resume
     def build_target_keywords_from_optimizer(kw_obj, resume_text: str, jd_text: str):
@@ -446,12 +444,6 @@ if resume_text.strip() and jd_text.strip():
             outlets_ordered.extend(variants)
 
         gaps_terms = list(kw_obj.get("missing") or [])
-        if not gaps_terms:
-            try:
-                fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-            except Exception:
-                fallback_missing = []
-            gaps_terms = list(fallback_missing or [])
         for g in gaps_terms:
             g = (g or "").strip()
             if g:
@@ -496,27 +488,11 @@ if resume_text.strip() and jd_text.strip():
         with colk2:
             st.markdown("**Gaps**")
 
-            # Use direct LLM values if available
-            missing = kw_obj.get("missing") if isinstance(kw_obj, dict) else []
-            weak = kw_obj.get("weak") if isinstance(kw_obj, dict) else []
+            # Use only LLM-provided missing terms as Gaps
+            gaps = kw_obj.get("missing") if isinstance(kw_obj, dict) else []
+            st.write("Gaps:", ", ".join(gaps) if gaps else "—")
 
-            # Only fallback if completely None (not just empty list)
-            if missing is None:
-                try:
-                    fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                except Exception:
-                    fallback_missing = []
-                missing = fallback_missing or []
-            if weak is None:
-                try:
-                    _fm, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                except Exception:
-                    fallback_weak = []
-                weak = fallback_weak or []
-
-            st.write("Missing:", ", ".join(missing) if missing else "—")
-            st.write("Weak:", ", ".join(weak) if weak else "—")
-
+            st.caption("🔍 These are JD-specific technologies/skills missing from your resume.")
 
     # -----------------
     # Keyword Sentence Generator (ATS-friendly) — SEPARATE EDITOR
@@ -549,7 +525,7 @@ if resume_text.strip() and jd_text.strip():
                         fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
                     except Exception:
                         fallback_missing = []
-                    gaps_terms = list(fallback_missing or [])
+                    gaps_terms = list(kw_obj.get("missing") or [])
 
                 seen, target_all = set(), []
                 for t in ranked_terms + gaps_terms:
