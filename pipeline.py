@@ -163,6 +163,33 @@ def analyze(resume_text: str, jd_text: str) -> Dict[str, Any]:
     report["contacts"] = extract_contacts_regex(resume_text)
     return report
 
+def clean_keyword_output(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fix LLM keyword output:
+    - Remove duplicates between 'keywords' and 'missing'.
+    - Ensure ranks are unique and sequential.
+    """
+    if not obj:
+        return {"keywords": [], "missing": [], "weak": [], "summary": ""}
+
+    # Collect all terms already in keywords
+    keyword_terms = { (item.get("term") or "").lower().strip() for item in obj.get("keywords", []) }
+
+    # Remove duplicates from missing
+    missing_terms = []
+    for t in obj.get("missing", []):
+        if t and t.lower().strip() not in keyword_terms:
+            missing_terms.append(t)
+    obj["missing"] = missing_terms
+
+    # Normalize ranks (1..N)
+    kws = obj.get("keywords", [])
+    for i, item in enumerate(kws, 1):
+        item["rank"] = i
+    obj["keywords"] = kws
+
+    return obj
+
 # -----------------------------
 # Keywords (LLM)
 # -----------------------------
@@ -170,6 +197,7 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                          provider_pref: Optional[str], model_name: Optional[str],
                          temperature: float, max_tokens: int, keys: Dict[str,str]) -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
+
     raw = provider.chat(
         model=model_name,
         system=SYSTEM_KEYWORDS,
@@ -177,13 +205,64 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         temperature=temperature,
         max_tokens=max_tokens
     )
-    raw = (raw or "").strip().strip('`').strip()
+
+    raw = (raw or "").strip().strip("`").strip()
+
+    # 🔍 Debug raw output
+    print("\n=== RAW LLM OUTPUT ===")
+    print(raw)
+    print("======================\n")
+
     try:
-        start = raw.find('{'); end = raw.rfind('}') + 1
-        obj = json.loads(raw[start:end])
-    except Exception:
+        # extract only the JSON part from raw
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        cleaned = raw[start:end]
+
+        obj = json.loads(cleaned)
+    except Exception as e:
         obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
+        obj["_parse_error"] = str(e)
+        obj["_raw_json"] = raw
+
+    # ✅ normalize so GUI loop doesn’t break
+    if "keywords" not in obj or not isinstance(obj["keywords"], list):
+        obj["keywords"] = []
+    obj["missing"] = obj.get("missing", [])
+    obj["weak"] = obj.get("weak", [])
+    obj["summary"] = obj.get("summary", "")
+
+    # ✅ attach raw JSON for debug
+    obj["_raw_json"] = raw
+    # ✅ enforce that all JD terms are captured
+    obj = enforce_jd_keywords(obj, jd_text)
+
     return obj
+
+
+    
+
+
+
+def enforce_jd_keywords(obj, jd_text: str):
+    """
+    Ensure no important JD keywords are missed.
+    If the LLM forgot them, force-add into 'missing'.
+    """
+    jd_terms = re.findall(r"\b[A-Z][A-Za-z0-9\+\-_/]{2,}\b", jd_text)  # crude: grabs AWS, SQL, Kubernetes, etc.
+    jd_terms = list(set(jd_terms))
+
+    present_terms = [item["term"].lower() for item in obj.get("keywords", [])]
+    missing_terms = set(obj.get("missing", []))
+
+    for t in jd_terms:
+        tl = t.lower()
+        if tl not in present_terms:
+            missing_terms.add(t)
+
+    obj["missing"] = sorted(missing_terms)
+    return obj
+
 
 # -----------------------------
 # Keyword sentences (Core Competencies only)
@@ -568,4 +647,3 @@ def extract_ats_llm_from_optimizer(
             })
     obj["suggestions"] = fixed_sugg
     return obj
-

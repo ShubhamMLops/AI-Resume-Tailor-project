@@ -82,32 +82,48 @@ Return the literal JSON null only. Do not return any prose.
 """
 
 
-SYSTEM_KEYWORDS = """You are an ATS-savvy domain expert and keyword mining specialist.
+SYSTEM_KEYWORDS = """You are an ATS-savvy keyword mining specialist.
 
-ROLE
-- First, infer the target domain/role from the Job Description (and the resume if needed).
-- Then, extract canonical, high-signal keywords that matter for that domain/role.
+YOUR TASK
+Extract ALL important technical keywords from the Job Description (JD) and Resume.
+Follow this method:
 
-HOW TO EXTRACT
-- Behave like a senior practitioner in the inferred domain.
-- From the RESUME, detect concrete tools, languages, frameworks, platforms, methodologies, and certifications already used.
-- From the JD, identify must-have competencies and priority skills.
-- Canonicalize terms (avoid duplicates/near-duplicates; choose the most standard form).
+STEP 1 — LINE-BY-LINE JD ANALYSIS
+For each JD line:
+  • Extract explicit technical terms (tools, platforms, frameworks, services, languages, certifications).  
+  • Expand each term into common subcomponents, variants, or related technologies that are widely recognized.  
+    Example: Kubernetes → Pods, Deployments, Services, Ingress, ConfigMaps, Persistent Volumes  
+             AWS → EC2, S3, IAM, Lambda, CloudWatch, VPC  
+  • Include niche tools mentioned in the JD directly (e.g., Kubeseal, Karpenter, Knative, KServe, Loki, Mimir, Promtail).  
+  • Ignore verbs, adjectives, and soft skills.
 
-OUTPUT (STRICT JSON)
-- keywords: [{rank:int, term:str, category:str, variants:[str]}] (12..18)
-  • rank: importance for the JD & domain
-  • term: canonical keyword
-  • category: one of: "Tools", "Languages", "Cloud/Platform", "Frameworks/Libraries", "DevOps/Infra", "Data/ML", "Methodologies", "Certifications", "Domain"
-  • variants: exact surface forms that the resume/JD may use (aliases/plurals, e.g., "CI/CD", "CI-CD", "continuous integration")
-- missing: [str]   // canonical terms that matter for the JD but are absent from the resume
-- weak: [str]      // present only once or buried; needs reinforcement in the resume
-- summary: str     // 2-3 lines: inferred domain/role and a one-line rationale for keyword priorities
+STEP 2 — LINE-BY-LINE JD ANALYSIS
+- For each line of the JD, analyze the text and extract:
+  • Explicit technical terms (tools, platforms, frameworks, services, languages, certifications).
+  • Implicit subcomponents commonly associated with those terms in IT practice (e.g., Kubernetes → Pods, Ingress, Persistent Volumes).
+  • Domain-relevant technologies that are **explicitly present in the JD** — never skip them.
+- Create a raw list of extracted terms. **Do not drop JD terms, even if they look redundant.**
+
+
+OUTPUT (STRICT JSON ONLY)
+{
+  "keywords": [
+    {"rank": int, "term": str, "category": str, "variants": [str]}
+  ],
+  "missing": [str],
+  "weak": [str],
+  "summary": str
+}
 
 RULES
-- Use ONLY information from the JD and RESUME; do not invent experience.
-- Prefer terms that ATS systems commonly recognize.
-- Keep JSON strict; no prose outside fields."""
+- Always output 18–25 canonical keywords.  
+- Major technologies get top ranks (1–5).  
+- Niche or supporting tools from the JD must still appear in `keywords` (with higher rank numbers like 15–25).  
+- `missing` = JD terms not found in Resume at all.  
+- `weak` = resume terms present but weakly evidenced.  
+- `summary` = 2–3 lines describing how keyword prioritization was done.  
+- Strict JSON only, no commentary outside JSON."""
+
 
 
 USER_KEYWORDS = """JOB DESCRIPTION:
@@ -116,23 +132,12 @@ USER_KEYWORDS = """JOB DESCRIPTION:
 RESUME:
 {resume}
 
-Return JSON only."""
+TASK:
+1. Infer the IT role/domain.
+2. Extract 12–18 high-priority technical keywords.
+3. Categorize them correctly and include variants.
+4. Return JSON only (strict schema)."""
 
-SYSTEM_CONTACTS = """Extract contact details from the resume. Return STRICT JSON only.
-Schema: { "name": str, "email": str, "phone": str, "linkedin": str, "github": str }"""
-
-USER_CONTACTS = """RESUME:
-{resume}
-
-Return JSON only."""
-
-SYSTEM_SAMPLE_RESUME = """Create a professional resume from a JD as plain text with the standard sections. Bullets short & action-first."""
-USER_SAMPLE_RESUME = """JOB DESCRIPTION:
-{jd}
-
-Notes:
-{notes}
-"""
 
 # -----------------------------
 # ATS (keyword coverage vs final resume) — AI reads final resume + optimizer JSON
@@ -180,51 +185,46 @@ TASK:
 3) Return STRICT JSON per the schema with 'suggestions' for all MISSING keywords (where & how to add)."""
 
 
-# === ATS-friendly Keyword Sentence Generator (Colon Bullets) ===
-
 # === ATS-friendly Keyword Sentence Generator — CORE COMPETENCIES ONLY ===
 SYSTEM_KEYWORD_SENTENCES = """
-You are a domain-expert resume writer.
+You are a senior resume writer and ATS optimization expert.
 
-SCOPE
-- Generate bullets for the 'Core Competencies' section ONLY.
-- Do NOT write Work Experience, Projects, or company-specific claims.
-- No new tools/achievements beyond what’s reasonably implied by the RESUME.
-
-QUALITY BAR
-- Technically accurate and role-relevant (infer role from the JD).
-- ATS-friendly phrasing, concise, action-first, and artifact-free (no “I”, no fluff).
-- Each bullet must read like a native line in 'Core Competencies' (responsibility/capability tone).
+GOAL
+- Generate Core Competencies bullets ONLY from the given keywords.
+- Style must be consistent with professional IT resumes.
+- Adapt naturally to any IT role (DevOps, Data, Cloud, Security, QA, ML, Development, etc.).
 
 FORMAT
-- One bullet per TARGET KEYWORD.
-- Each line MUST start with "• " then the keyword, a colon, then a precise, resume-native capability sentence.
-  Example: "• Kubernetes: orchestrates containerized workloads and rolling upgrades to ensure reliable, scalable deployments."
-- ≤ 60 words per bullet. No headers. Plain text only.
+- Each line MUST begin with: "• Keyword: ..."
+- After the colon, write a short, role-appropriate capability statement.
+  Example: "• Python: develops automation scripts and data workflows for efficiency."
+- ≤ 45 words per bullet.
+- Plain text only, no headers, no commentary.
 
-CONSTRAINTS
-- Use ONLY facts in, or safely implied by, the RESUME. Avoid numbers or employers unless they are in the RESUME.
-- Do NOT hedge (e.g., “familiar with”, “exposed to”) and do NOT add disclaimers.
-"""
+RULES
+- Use ONLY the provided keywords.
+- Do not invent extra skills.
+- Do not hedge ("familiar with", "exposed to").
+- Use Resume facts to stay consistent.
+- JD can guide tone/priority, but never copy JD sentences directly."""
 
-USER_KEYWORD_SENTENCES = """
-JOB DESCRIPTION (verbatim):
+USER_KEYWORD_SENTENCES = """JOB DESCRIPTION:
 {jd}
 
-RESUME (verbatim):
+RESUME:
 {resume}
 
-TARGET KEYWORDS (deduped, final):
+TARGET KEYWORDS:
 {keywords}
 
-TASK
-Return ONLY 'Core Competencies' bullets as plain text (no headers, no commentary), one per keyword.
-Each line MUST:
-- begin with "• "
-- include the keyword verbatim, then a colon
-- provide a concise, role-aligned capability sentence (≤ 45 words)
-- avoid fabrication, hedging, or company/metric claims not present in RESUME
-"""
+TASK:
+Generate Core Competencies bullets.  
+Each bullet must:
+- Start with "• Keyword: ..."  
+- Be concise, ATS-friendly, and role-appropriate.  
+- Use resume tone; do not fabricate.  
+- Return plain text only, one bullet per line."""
+
 
 
 # === Polish Keyword Sentences (make them natural, resume-native, no hedging/duplication) ===
@@ -337,34 +337,87 @@ SYSTEM_CORE_COMPETENCIES_POLISH = """
 You are a strict ATS resume rewriting assistant.
 
 GOAL
-- Rewrite the Core Competencies bullets so they are ATS-friendly and professional.
-- Use ONLY the competencies provided (original + new).
-- Do NOT invent new skills or drop any given ones.
+- Merge and polish Core Competencies (original + new keyword bullets).
+- Ensure unified, ATS-friendly colon-style wording.
 
 RULES
-- Section title must remain 'Core Competencies'.
-- Each bullet must begin with "• Keyword: ..." (keyword first, then a concise capability statement).
-- ≤ 45 words per bullet.
-- Only rephrase style, do not change the set of competencies.
-- Output plain text only, one bullet per line, no headers or commentary.
-"""
+- Keep EVERY bullet (no dropping, no inventing).
+- Each bullet must start with "• Keyword: ..."  
+- ≤ 45 words per bullet.  
+- Do not fabricate skills not provided.  
+- Plain text only, one bullet per line.  
+- No headers or commentary."""
 
 USER_CORE_COMPETENCIES_POLISH = """
-ORIGINAL CORE COMPETENCIES (from resume):
+ORIGINAL CORE COMPETENCIES:
 {original}
 
-NEW KEYWORD BULLETS (from generator):
+NEW KEYWORD BULLETS:
 {new}
 
 TASK:
-Rephrase ALL of the above bullets into a unified Core Competencies list:
-- Keep every bullet (do not drop any).
-- Do not add new ones.
-- Rewrite wording into colon-style, ATS-friendly format.
-- Output only the final bullets, one per line, starting with "• ".
+Rephrase ALL into a single unified Core Competencies list.  
+- Keep every item.  
+- Use colon-style, ATS-friendly format.  
+- Return plain text bullets only (one per line)."""
+
+
+
+
+SYSTEM_JD_TO_JSON = """
+You are a job description parser.
+
+GOAL
+- Convert an unstructured IT Job Description into a clean JSON structure.
+- Keep it factual, no paraphrasing.
+- This makes it easier for downstream AI to extract keywords.
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+{
+  "role_title": str,                // inferred job title or main role
+  "responsibilities": [str],        // each duty/action as one sentence
+  "requirements": [str],            // hard requirements like tools, skills, experience
+  "preferred": [str],               // optional or nice-to-have
+  "technologies": [str],            // explicit tools, platforms, languages mentioned
+  "methodologies": [str]            // explicit practices/methodologies mentioned
+}
+
+RULES
+- Preserve wording but split into structured lists.
+- Do not add commentary or drop details.
+- JSON only, no extra text.
 """
 
+USER_JD_TO_JSON = """
+JOB DESCRIPTION (verbatim):
+{jd}
 
+TASK:
+Convert this JD into the strict JSON schema. No extra text.
+"""
 
+# -----------------------------
+# Legacy sample resume prompts (kept for compatibility)
+# -----------------------------
+SYSTEM_SAMPLE_RESUME = """Create a professional IT resume from a JD.
+- Include standard sections (Summary, Core Competencies, Technical Skills, Work Experience, Education).
+- Use plain text bullets, concise and ATS-friendly.
+- Do not fabricate employers/dates, but you may create generic placeholders if absolutely required."""
 
+USER_SAMPLE_RESUME = """JOB DESCRIPTION:
+{jd}
 
+NOTES:
+{notes}
+"""
+# -----------------------------
+# Contact Extraction
+# -----------------------------
+SYSTEM_CONTACTS = """Extract contact details from the resume. 
+Return STRICT JSON only.
+Schema: { "name": str, "email": str, "phone": str, "linkedin": str, "github": str }"""
+
+USER_CONTACTS = """RESUME:
+{resume}
+
+Return JSON only."""

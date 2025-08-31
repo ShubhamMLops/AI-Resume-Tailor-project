@@ -366,6 +366,13 @@ if resume_text.strip() and jd_text.strip():
 
     kw_obj = st.session_state.get("kw_llm")
 
+    if kw_obj and "_raw_extraction" in kw_obj:
+        with st.expander("🔍 Raw Extraction from LLM"):
+            st.text(kw_obj["_raw_extraction"])
+
+
+
+
     def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
         missing_terms = []
         try:
@@ -465,26 +472,51 @@ if resume_text.strip() and jd_text.strip():
         colk1, colk2 = st.columns(2)
         with colk1:
             st.markdown("**Top Keywords (ranked)**")
-            if kw_obj.get("keywords"):
-                for item in kw_obj["keywords"]:
-                    term = item.get("term")
-                    cat = item.get("category","general")
+
+            # make sure kw_obj is dict and has 'keywords'
+            keywords = []
+            if isinstance(kw_obj, dict):
+                keywords = kw_obj.get("keywords", [])
+
+            if keywords and isinstance(keywords, list):
+                for item in keywords:
+                    term = item.get("term", "").strip()
+                    if not term:
+                        continue
+                    cat = item.get("category", "general")
                     variants = item.get("variants", [])
-                    rank = item.get("rank")
+                    rank = item.get("rank", "?")
                     suffix = f" · variants: {', '.join(variants)}" if variants else ""
                     st.write(f"{rank}. **{term}** · _{cat}_{suffix}")
             else:
-                st.write("No keywords returned.")
+                st.error("⚠️ No parsed keywords available from LLM.")
+                st.text("=== RAW JSON FROM LLM ===\n" + str(kw_obj.get("_raw_json", "")))
+
+
         with colk2:
             st.markdown("**Gaps**")
-            missing = kw_obj.get("missing")
-            weak = kw_obj.get("weak")
-            if not isinstance(missing, list) or not missing or not isinstance(weak, list) or not weak:
-                fallback_missing, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                if not isinstance(missing, list) or not missing: missing = fallback_missing
-                if not isinstance(weak, list) or not weak: weak = fallback_weak
+
+            # Use direct LLM values if available
+            missing = kw_obj.get("missing") if isinstance(kw_obj, dict) else []
+            weak = kw_obj.get("weak") if isinstance(kw_obj, dict) else []
+
+            # Only fallback if completely None (not just empty list)
+            if missing is None:
+                try:
+                    fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
+                except Exception:
+                    fallback_missing = []
+                missing = fallback_missing or []
+            if weak is None:
+                try:
+                    _fm, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
+                except Exception:
+                    fallback_weak = []
+                weak = fallback_weak or []
+
             st.write("Missing:", ", ".join(missing) if missing else "—")
             st.write("Weak:", ", ".join(weak) if weak else "—")
+
 
     # -----------------
     # Keyword Sentence Generator (ATS-friendly) — SEPARATE EDITOR
@@ -970,4 +1002,3 @@ if resume_text.strip() and jd_text.strip():
 
 else:
     st.info("Upload or paste both the Resume and the Job Description to begin.")
-
