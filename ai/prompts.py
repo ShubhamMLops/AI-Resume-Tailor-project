@@ -421,3 +421,23 @@ USER_CONTACTS = """RESUME:
 {resume}
 
 Return JSON only."""
+
+SYSTEM_GAPS = """You are an assistant that identifies missing skills/technologies."""
+USER_GAPS = """Job Description:
+{jd}
+
+Resume:
+{resume}
+
+Top Keywords (ranked + variants):
+{keywords}
+
+Task:
+1. Compare the Top Keywords list against the Resume content.  
+2. If a keyword (or any of its variants) is missing in the Resume, mark it as a GAP.  
+3. Return strict JSON:
+
+{{
+  "gaps": ["keyword1", "keyword2", "keyword3"]
+}}
+"""
