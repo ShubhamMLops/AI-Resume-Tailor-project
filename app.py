@@ -1,6 +1,7 @@
 import io, os, json, re
 import streamlit as st
 from utils import export_docx, export_pdf
+from pipeline import extract_gaps
 from pipeline import (
     analyze,
     tailor,
@@ -366,34 +367,39 @@ if resume_text.strip() and jd_text.strip():
 
     kw_obj = st.session_state.get("kw_llm")
 
-    def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
-        missing_terms = []
-        try:
-            bow_missing = [w for (w, _) in (report["keywords_bow"]["missing"] or [])]
-            seen = set()
-            for w in bow_missing:
-                wl = w.lower().strip()
-                if len(wl) > 2 and wl not in seen:
-                    seen.add(wl); missing_terms.append(w)
-            missing_terms = missing_terms[:20]
-        except Exception:
-            missing_terms = []
+    if kw_obj and "_raw_extraction" in kw_obj:
+        with st.expander("🔍 Raw Extraction from LLM"):
+            st.text(kw_obj["_raw_extraction"])
 
-        weak_terms = []
+
+
+
+    def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
+        """
+        Extract true skill gaps: tools/technologies from JD not already in Top Keywords.
+        No verbs or filler words.
+        """
+        gap_terms = []
         try:
-            text_low = " " + " ".join(resume_text.lower().split()) + " "
-            terms = [(item.get("term") or "").strip() for item in (kw_obj.get("keywords") or [])]
-            seen2 = set()
-            for t in terms:
-                tl = t.lower()
-                if not tl or tl in seen2: continue
-                seen2.add(tl)
-                if text_low.count(" " + tl + " ") == 1:
-                    weak_terms.append(t)
-            weak_terms = weak_terms[:20]
+            # Capture capitalized tech terms / acronyms from JD
+            jd_tokens = re.findall(r"\b[A-Z][A-Za-z0-9+\-_/]{2,}\b", jd_text)
+            jd_tokens = [t for t in jd_tokens if len(t) > 2]
+
+            # Already covered keywords
+            seen_keywords = { (item.get("term") or "").lower() for item in (kw_obj.get("keywords") or []) }
+
+            # Filter out those already present
+            gap_terms = [t for t in jd_tokens if t.lower() not in seen_keywords]
+
+            # Deduplicate and sort
+            gap_terms = sorted(set(gap_terms))
         except Exception:
-            weak_terms = []
-        return missing_terms, weak_terms
+            gap_terms = []
+
+        # Weak terms: keep existing logic (or leave empty if you don’t want it at all)
+        weak_terms = []
+        return gap_terms, weak_terms
+
 
     # Build target keywords from Optimizer (ranked + gaps), deduped, excluding ones already in resume
     def build_target_keywords_from_optimizer(kw_obj, resume_text: str, jd_text: str):
@@ -439,12 +445,6 @@ if resume_text.strip() and jd_text.strip():
             outlets_ordered.extend(variants)
 
         gaps_terms = list(kw_obj.get("missing") or [])
-        if not gaps_terms:
-            try:
-                fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-            except Exception:
-                fallback_missing = []
-            gaps_terms = list(fallback_missing or [])
         for g in gaps_terms:
             g = (g or "").strip()
             if g:
@@ -465,26 +465,37 @@ if resume_text.strip() and jd_text.strip():
         colk1, colk2 = st.columns(2)
         with colk1:
             st.markdown("**Top Keywords (ranked)**")
-            if kw_obj.get("keywords"):
-                for item in kw_obj["keywords"]:
-                    term = item.get("term")
-                    cat = item.get("category","general")
+
+            # make sure kw_obj is dict and has 'keywords'
+            keywords = []
+            if isinstance(kw_obj, dict):
+                keywords = kw_obj.get("keywords", [])
+
+            if keywords and isinstance(keywords, list):
+                for item in keywords:
+                    term = item.get("term", "").strip()
+                    if not term:
+                        continue
+                    cat = item.get("category", "general")
                     variants = item.get("variants", [])
-                    rank = item.get("rank")
+                    rank = item.get("rank", "?")
                     suffix = f" · variants: {', '.join(variants)}" if variants else ""
                     st.write(f"{rank}. **{term}** · _{cat}_{suffix}")
             else:
-                st.write("No keywords returned.")
+                st.error("⚠️ No parsed keywords available from LLM.")
+                st.text("=== RAW JSON FROM LLM ===\n" + str(kw_obj.get("_raw_json", "")))
+
+
         with colk2:
             st.markdown("**Gaps**")
-            missing = kw_obj.get("missing")
-            weak = kw_obj.get("weak")
-            if not isinstance(missing, list) or not missing or not isinstance(weak, list) or not weak:
-                fallback_missing, fallback_weak = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                if not isinstance(missing, list) or not missing: missing = fallback_missing
-                if not isinstance(weak, list) or not weak: weak = fallback_weak
-            st.write("Missing:", ", ".join(missing) if missing else "—")
-            st.write("Weak:", ", ".join(weak) if weak else "—")
+            try:
+                gaps = extract_gaps(resume_text, kw_obj)
+            except Exception:
+                gaps = []
+            st.write("Gaps:", ", ".join(gaps) if gaps else "—")
+            st.caption("🔍 These are Top Keywords missing from your resume.")
+
+
 
     # -----------------
     # Keyword Sentence Generator (ATS-friendly) — SEPARATE EDITOR
@@ -517,7 +528,7 @@ if resume_text.strip() and jd_text.strip():
                         fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
                     except Exception:
                         fallback_missing = []
-                    gaps_terms = list(fallback_missing or [])
+                    gaps_terms = list(kw_obj.get("missing") or [])
 
                 seen, target_all = set(), []
                 for t in ranked_terms + gaps_terms:
@@ -970,4 +981,3 @@ if resume_text.strip() and jd_text.strip():
 
 else:
     st.info("Upload or paste both the Resume and the Job Description to begin.")
-
