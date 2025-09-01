@@ -570,22 +570,21 @@ if resume_text.strip() and jd_text.strip():
                         return (w in tokens) or (alt in tokens)
                     return False
 
-                present_keywords, new_keywords = [], []
-                for t in target_all:
-                    key = _canon_local2(t)
-                    cand_forms = variants_map.get(key, [t, t.replace("-", " "), t.replace("/", " ")])
-                    seen_forms, cand_forms_dedup = set(), []
-                    for f in cand_forms:
-                        f = (f or "").strip()
-                        if not f:
-                            continue
-                        kf = f.lower()
-                        if kf in seen_forms:
-                            continue
-                        seen_forms.add(kf)
-                        cand_forms_dedup.append(f)
-                    found = any(_has_seq(text_tokens, f) for f in cand_forms_dedup)
-                    (present_keywords if found else new_keywords).append(t)
+                # Directly pick from Optimizer outputs
+                present_keywords = [item.get("term", "").strip()
+                                    for item in (kw_obj.get("keywords") or [])
+                                    if (item.get("term") or "").strip()]
+
+                # Safely read gaps (fallback to "missing" if gaps not present)
+                # NEW: Use extract_gaps (deterministic) instead of kw_obj["gaps"]
+                try:
+                    new_keywords = extract_gaps(resume_text, kw_obj)
+                except Exception:
+                    new_keywords = []
+
+                new_keywords = [kw.strip() for kw in new_keywords if kw and kw.strip()]
+
+
 
                 with st.expander("🔍 New keywords for your resume (not currently found)", expanded=True):
                     st.write(", ".join(new_keywords) if new_keywords else "— none —")
