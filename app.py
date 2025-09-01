@@ -1,7 +1,7 @@
 import io, os, json, re
 import streamlit as st
 from utils import export_docx, export_pdf
-from pipeline import extract_gaps_llm
+from pipeline import extract_gaps
 from pipeline import (
     analyze,
     tailor,
@@ -488,17 +488,14 @@ if resume_text.strip() and jd_text.strip():
 
         with colk2:
             st.markdown("**Gaps**")
-
-            # Use only LLM-provided missing terms as Gaps
-            gaps = extract_gaps_llm(
-                resume_text, jd_text, kw_obj.get("keywords", []),
-                provider_pref=provider, model_name=(model or None),
-                temperature=temperature, max_tokens=min(max_tokens, 800), keys=keys
-            )
+            try:
+                gaps = extract_gaps(resume_text, kw_obj)
+            except Exception:
+                gaps = []
             st.write("Gaps:", ", ".join(gaps) if gaps else "—")
+            st.caption("🔍 These are Top Keywords missing from your resume.")
 
 
-            st.caption("🔍 These are JD-specific technologies/skills missing from your resume.")
 
     # -----------------
     # Keyword Sentence Generator (ATS-friendly) — SEPARATE EDITOR

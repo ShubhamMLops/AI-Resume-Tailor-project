@@ -218,59 +218,50 @@ def enforce_jd_keywords(obj, jd_text: str, resume_text: str):
                 return True
         return False
 
-    gaps = [t for t in set(all_kw + jd_terms) if t and not _present(t)]
-    obj["gaps"] = sorted(set(gaps))
+
     return obj
 
 # -----------------------------
-# Gaps (LLM + deterministic)
+# Gaps (compare Top Keywords vs Resume)
 # -----------------------------
-def extract_gaps_llm(resume_text: str, jd_text: str, keywords: List[Dict[str, Any]],
-                     provider_pref: Optional[str], model_name: Optional[str],
-                     temperature: float, max_tokens: int, keys: Dict[str, str]) -> List[str]:
-    provider = _provider_from_keys(provider_pref, keys or {})
-
-    all_terms = []
-    for kw in (keywords or []):
-        if kw.get("term"):
-            all_terms.append(kw["term"])
-        all_terms.extend(kw.get("variants", []))
-    kw_blob = "\n".join(f"- {t}" for t in all_terms if t)
-
-    raw = provider.chat(
-        model=model_name,
-        system="SYSTEM_GAPS",
-        user="USER_GAPS".format(jd=jd_text, resume=resume_text, keywords=kw_blob),
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
-    raw = (raw or "").strip().strip("`").strip()
-
-    try:
-        start = raw.find("{"); end = raw.rfind("}") + 1
-        obj = json.loads(raw[start:end])
-        llm_gaps = set(obj.get("gaps", []))
-    except Exception:
-        llm_gaps = set()
+def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
+    """
+    Compare Top Keywords (LLM JSON) vs Resume text.
+    Return keywords that are missing in resume.
+    """
+    keywords = kw_obj.get("keywords", [])
+    if not keywords:
+        return []
 
     token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    resume_tokens = [t.lower() for t in token_re.findall(resume_text)]
+    resume_tokens = [t.lower() for t in token_re.findall(resume_text or "")]
     resume_compact = "".join(resume_tokens)
 
     def _present(term: str) -> bool:
-        seq = [t.lower() for t in token_re.findall(term)]
-        if not seq: return False
+        seq = [t.lower() for t in token_re.findall(term or "")]
+        if not seq:
+            return False
         L = len(seq)
         for i in range(0, len(resume_tokens) - L + 1):
-            if resume_tokens[i:i+L] == seq: return True
-        if "".join(seq) in resume_compact: return True
+            if resume_tokens[i:i+L] == seq:
+                return True
+        if "".join(seq) in resume_compact:
+            return True
         if L == 1 and len(seq[0]) > 3:
-            base = seq[0]; alt = base[:-1] if base.endswith("s") else base + "s"
+            base = seq[0]
+            alt = base[:-1] if base.endswith("s") else base + "s"
             return base in resume_tokens or alt in resume_tokens
         return False
 
-    deterministic_gaps = {t for t in all_terms if not _present(t)}
-    return sorted(llm_gaps | deterministic_gaps)
+    # collect all terms from Top Keywords (term + variants)
+    all_terms = []
+    for item in keywords:
+        if item.get("term"):
+            all_terms.append(item["term"])
+        all_terms.extend(item.get("variants", []))
+
+    gaps = [t for t in set(all_terms) if t and not _present(t)]
+    return sorted(set(gaps))
 
 # -----------------------------
 # Keyword Sentences
