@@ -237,31 +237,45 @@ def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
     resume_tokens = [t.lower() for t in token_re.findall(resume_text or "")]
     resume_compact = "".join(resume_tokens)
 
+    def _tok_seq(s: str):
+        return [t.lower() for t in token_re.findall(s or "")]
+
     def _present(term: str) -> bool:
-        seq = [t.lower() for t in token_re.findall(term or "")]
+        seq = _tok_seq(term)
         if not seq:
             return False
         L = len(seq)
+        # check sequential match
         for i in range(0, len(resume_tokens) - L + 1):
             if resume_tokens[i:i+L] == seq:
                 return True
+        # compact match (CI/CD -> cicd)
         if "".join(seq) in resume_compact:
             return True
+        # plural/singular match for single words
         if L == 1 and len(seq[0]) > 3:
             base = seq[0]
             alt = base[:-1] if base.endswith("s") else base + "s"
-            return base in resume_tokens or alt in resume_tokens
+            if base in resume_tokens or alt in resume_tokens:
+                return True
         return False
 
     # collect all terms from Top Keywords (term + variants)
     all_terms = []
     for item in keywords:
         if item.get("term"):
-            all_terms.append(item["term"])
-        all_terms.extend(item.get("variants", []))
+            base = item["term"]
+            all_terms.append(base)
+            # also add normalized versions
+            all_terms.append(base.replace("/", "").replace("-", ""))
+        for v in item.get("variants", []):
+            all_terms.append(v)
+            all_terms.append(v.replace("/", "").replace("-", ""))
 
+    # filter those missing in resume
     gaps = [t for t in set(all_terms) if t and not _present(t)]
     return sorted(set(gaps))
+
 
 # -----------------------------
 # Keyword Sentences
