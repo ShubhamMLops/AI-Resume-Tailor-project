@@ -19,15 +19,14 @@ KEYWORD INTEGRATION & PLACEMENT
 - If a keyword already exists, refine that wording in-place — do NOT duplicate it elsewhere.
 - If a keyword is truly missing, add a single, responsibility-style line in the most appropriate existing section so it reads native.
 - Placement rules:
-  • Choose the most contextually appropriate section (e.g., Core Competencies/Skills, Technical Skills, or a relevant role).
+  • Prefer placing tool/technology keywords under 'Technical Skills' with grouped headings (Cloud Computing, Databases, DevOps Tools, Containerization, Infrastructure as Code, etc.).
+  • If the resume already uses 'Technical Skills', replace it with the supplied, grouped block.
   • NEVER place added lines at the very top of the document or the very end.
   • Do not create new sections unless the resume already uses that structure and it is clearly warranted.
 
 OUTPUT
 - Plain text only (no markdown or code fences).
 """
-
-
 
 USER_TAILOR = """JOB DESCRIPTION (verbatim):
 {jd}
@@ -42,7 +41,7 @@ TASK:
 Return a structured resume as plain text with section headings from the style above and bullet lines starting with '• '.
 HARD CONSTRAINTS:
 - Weave ONLY the TARGET KEYWORDS; do not add synonyms or extra terms beyond the list.
-- If a target keyword is not evidenced by the resume, include it in 'Core Competencies' with a concise, role-aligned one-line definition (no false claims of usage/ownership).
+- If a target keyword is not evidenced by the resume, include it under 'Technical Skills' with a concise grouping entry (Heading: keyword).
 - Ensure EVERY TARGET KEYWORD appears at least once somewhere appropriate."""
 
 SYSTEM_TAILOR_JSON = """You are a strict resume tailoring assistant.
@@ -56,7 +55,7 @@ PRIMARY DIRECTIVE
 OBJECTIVE
 - Integrate ONLY the provided TARGET KEYWORDS (and nothing else) NATURALLY into the existing resume content.
 - If a keyword is ALREADY covered by the resume, refine the wording in-place (stronger verbs, clearer impact) WITHOUT adding duplicates.
-- If a keyword is NOT evidenced anywhere, add a single concise, responsibility-style line in the most appropriate existing section (e.g., Core Competencies/Skills) using the resume’s native bullet/format pattern.
+- If a keyword is NOT evidenced anywhere, add a single concise, responsibility-style line in the most appropriate existing section (prefer 'Technical Skills') using the resume’s native bullet/format pattern.
 
 STYLE RULES (follow the resume’s own style first)
 - Keep the original bullet marker and punctuation style.
@@ -140,7 +139,119 @@ TASK:
 
 
 # -----------------------------
-# ATS (keyword coverage vs final resume) — AI reads final resume + optimizer JSON
+# NEW: System prompt for generating grouped Technical Skills JSON
+# -----------------------------
+SYSTEM_KEYWORD_SENTENCES = """
+You are a senior resume writer and ATS optimization expert.
+
+GOAL
+- From the provided keywords (target list) and resume context, produce a JSON mapping of grouped Technical Skills that is ready to insert into a resume's 'Technical Skills' section.
+
+OUTPUT (STRICT JSON ONLY)
+Return JSON with this exact schema:
+
+{
+  "skills": {
+    "<Heading 1>": ["skill1", "skill2", ...],
+    "<Heading 2>": ["skill1", "skill2", ...],
+    ...
+  }
+}
+
+REQUIREMENTS
+- Group related skills under meaningful headings (e.g., "Cloud Computing", "Databases", "Containerization", "DevOps Tools", "CI/CD", "Infrastructure as Code", "Monitoring & Observability").
+- Place the highest priority keywords from the provided list into the most relevant headings.
+- Do NOT produce 'Core Competencies' as a heading. Everything belongs under 'skills' headings.
+- Do not invent unrelated technologies; use resume + provided keywords only. If the list is small, group under "Technical Skills".
+- Each skill value must be a short token (no long sentences).
+- Return strict JSON only — no explanatory text.
+"""
+
+USER_KEYWORD_SENTENCES = """
+JOB DESCRIPTION:
+{jd}
+
+RESUME:
+{resume}
+
+TARGET_KEYWORDS:
+{keywords}
+
+TASK:
+Return a JSON object with a 'skills' mapping (heading -> list of skills) following the schema specified by the system prompt.
+"""
+
+# === Polish Keyword Sentences (kept for compatibility) ===
+SYSTEM_KEYWORD_SENTENCES_POLISH = """
+You are a senior, ATS-savvy resume writer.
+
+GOAL
+- Polish the provided keyword sentences so they read naturally as part of the candidate’s resume.
+
+INPUTS
+- RESUME (for tone, tense, context): do not contradict or invent facts.
+- BULLETS: concise keyword sentences (one per line), colon-style ("• Keyword: short impact").
+- OPTIONAL JD: use only to align tone/priority.
+
+RULES
+- Keep bullets ≤ 45 words, action-first, ATS-friendly nouns, no first-person.
+- Remove weak/hedging phrases (e.g., “familiar with”, “exposed to”).
+- If a bullet duplicates an idea already present in the RESUME, refine wording to avoid repetition (do not delete; rewrite to add value).
+- Keep keywords verbatim once at the start of each line ("• Keyword: ...").
+- Maintain plain text only, one bullet per line, no headers or commentary.
+"""
+
+USER_KEYWORD_SENTENCES_POLISH = """
+RESUME:
+{resume}
+
+BULLETS:
+{bullets}
+
+OPTIONAL JOB DESCRIPTION:
+{jd}
+
+TASK:
+Return the polished bullets only, one per line, exactly in the same colon style and order.
+"""
+
+# ==== Professional Summary (bullets) prompts ====
+SYSTEM_SUMMARY_BULLETS = """
+You are a senior, ATS-savvy resume writer.
+
+Goal
+- Rewrite the Professional Summary / Profile Summary section into bullet points.
+- Preserve all the ideas from the resume summary.
+- Re-express them in ATS-friendly, professional bullet style.
+
+Rules
+- Each line must start with "• ".
+- ≤ 70 words per bullet (may exceed slightly if needed for clarity).
+- Use resume facts only; do not fabricate or drop.
+- Expand each bullet to highlight impact, scope, and relevance to the job description.
+- Language: clean, professional, consistent with the rest of the resume.
+
+Output
+- Plain text only, one bullet per line, no headers.
+"""
+
+USER_SUMMARY_BULLETS = """
+RESUME SUMMARY SECTION:
+{resume}
+
+(Optional job description for tone alignment):
+{jd}
+
+TASK:
+Return the above summary rewritten ONLY as bullet points.
+- Keep the same ideas and order.
+- Each line begins with "• ".
+- Do not drop or add any content.
+"""
+
+
+# -----------------------------
+# ATS (keyword coverage vs final resume) — unchanged
 # -----------------------------
 SYSTEM_ATS = """You are an ATS keyword coverage evaluator for resumes.
 
@@ -168,7 +279,7 @@ Schema:
 }
 Constraints:
 - Do NOT add new keywords beyond the provided terms and their explicit variants.
-- Prefer 'Core Competencies' for responsibilities; 'Technical Skills' for tools/tech; 'Work Experience' only if safe to generalize without fabricating employers/dates."""
+- Prefer 'Technical Skills' for responsibilities; 'Technical Skills' for tools/tech; 'Work Experience' only if safe to generalize without fabricating employers/dates."""
 
 USER_ATS = """FINAL RESUME (verbatim):
 {resume}
@@ -183,218 +294,6 @@ TASK:
 1) Parse the optimizer JSON. For each keyword, consider its 'term' and any 'variants'.
 2) Determine PRESENT or MISSING by token-level match in FINAL RESUME (case/spacing/punctuation-insensitive).
 3) Return STRICT JSON per the schema with 'suggestions' for all MISSING keywords (where & how to add)."""
-
-
-# === ATS-friendly Keyword Sentence Generator — CORE COMPETENCIES ONLY ===
-SYSTEM_KEYWORD_SENTENCES = """
-You are a senior resume writer and ATS optimization expert.
-
-GOAL
-- Generate Core Competencies bullets ONLY from the given keywords.
-- Style must be consistent with professional IT resumes.
-- Adapt naturally to any IT role (DevOps, Data, Cloud, Security, QA, ML, Development, etc.).
-
-FORMAT
-- Each line MUST begin with: "• Keyword: ..."
-- After the colon, write a short, role-appropriate capability statement.
-  Example: "• Python: develops automation scripts and data workflows for efficiency."
-- ≤ 45 words per bullet.
-- Plain text only, no headers, no commentary.
-
-RULES
-- Use ONLY the provided keywords.
-- Do not invent extra skills.
-- Do not hedge ("familiar with", "exposed to").
-- Use Resume facts to stay consistent.
-- JD can guide tone/priority, but never copy JD sentences directly."""
-
-USER_KEYWORD_SENTENCES = """JOB DESCRIPTION:
-{jd}
-
-RESUME:
-{resume}
-
-TARGET KEYWORDS:
-{keywords}
-
-TASK:
-Generate Core Competencies bullets.  
-Each bullet must:
-- Start with "• Keyword: ..."  
-- Be concise, ATS-friendly, and role-appropriate.  
-- Use resume tone; do not fabricate.  
-- Return plain text only, one bullet per line."""
-
-
-
-# === Polish Keyword Sentences (make them natural, resume-native, no hedging/duplication) ===
-SYSTEM_KEYWORD_SENTENCES_POLISH = """
-You are a senior, ATS-savvy resume writer.
-
-GOAL
-- Polish the provided keyword sentences so they read naturally as part of the candidate’s resume.
-
-INPUTS
-- RESUME (for tone, tense, context): do not contradict or invent facts.
-- BULLETS: concise keyword sentences (one per line), colon-style ("• Keyword: short impact").
-- OPTIONAL JD: use only to align tone/priority.
-
-RULES
-- Keep bullets ≤ 45 words, action-first, ATS-friendly nouns, no first-person.
-- Remove weak/hedging phrases (e.g., “familiar with”, “not explicitly mentioned”, “possesses”).
-- If a bullet duplicates an idea already present in the RESUME, refine wording to avoid repetition (do not delete; rewrite to add value).
-- Keep keywords verbatim once at the start of each line ("• Keyword: ...").
-- Maintain plain text only, one bullet per line, no headers or commentary.
-"""
-
-USER_KEYWORD_SENTENCES_POLISH = """
-RESUME:
-{resume}
-
-BULLETS:
-{bullets}
-
-OPTIONAL JOB DESCRIPTION:
-{jd}
-
-TASK:
-Return the polished bullets only, one per line, exactly in the same colon style and order.
-"""
-
-# ==== Professional Summary (bullets) prompts ====
-
-SYSTEM_SUMMARY_BULLETS = """
-You are a senior, ATS-savvy resume writer.
-
-Goal
-- Rewrite the Professional Summary / Profile Summary section into bullet points.
-- Preserve all the ideas from the resume summary.
-- Re-express them in ATS-friendly, professional bullet style.
-
-Rules
-- Each line must start with "• ".
-- ≤ 70 words per bullet (may exceed slightly if needed for clarity).
-- Use resume facts only; do not fabricate or drop.
-- Expand each bullet to highlight impact, scope, and relevance to the job description.
-- Language: clean, professional, consistent with the rest of the resume.
-
-Output
-- Plain text only, one bullet per line, no headers.
-"""
-
-
-
-USER_SUMMARY_BULLETS = """
-RESUME SUMMARY SECTION:
-{resume}
-
-(Optional job description for tone alignment):
-{jd}
-
-TASK:
-Return the above summary rewritten ONLY as bullet points.
-- Keep the same ideas and order.
-- Each line begins with "• ".
-- Do not drop or add any content.
-"""
-
-# === Rewrite Core Competencies (LLM, ATS-style) ===
-SYSTEM_CORE_COMPETENCIES_REWRITE = """
-You are a senior ATS-savvy resume writer.
-
-TASK
-- Rewrite the Core Competencies section so it reads in the same professional, ATS-friendly tone as the provided Keyword Sentence Generator bullets.
-- Replace all existing Core Competencies content with a rewritten version that is consistent and natural.
-- Use the KEYWORD BULLETS as the stylistic guide (tone, phrasing, bullet structure).
-
-RULES
-- Each bullet must start with "• ".
-- Use concise, professional, role-relevant wording.
-- ≤ 60 words per bullet.
-- Keep the meaning of the existing Core Competencies, but align wording with the Keyword Bullet style.
-- Plain text only; no headers.
-
-OUTPUT
-- Only Core Competencies bullets, one per line.
-"""
-
-USER_CORE_COMPETENCIES_REWRITE = """
-RESUME (verbatim):
-{resume}
-
-EXISTING CORE COMPETENCIES (verbatim):
-{core}
-
-KEYWORD BULLETS (style guide):
-{keywords}
-
-TASK:
-Rewrite the Core Competencies section using the style and tone of the Keyword Bullets.
-Return ONLY the rewritten bullets (plain text, one per line).
-"""
-
-SYSTEM_CORE_COMPETENCIES_POLISH = """
-You are a strict ATS resume rewriting assistant.
-
-GOAL
-- Merge and polish Core Competencies (original + new keyword bullets).
-- Ensure unified, ATS-friendly colon-style wording.
-
-RULES
-- Keep EVERY bullet (no dropping, no inventing).
-- Each bullet must start with "• Keyword: ..."  
-- ≤ 45 words per bullet.  
-- Do not fabricate skills not provided.  
-- Plain text only, one bullet per line.  
-- No headers or commentary."""
-
-USER_CORE_COMPETENCIES_POLISH = """
-ORIGINAL CORE COMPETENCIES:
-{original}
-
-NEW KEYWORD BULLETS:
-{new}
-
-TASK:
-Rephrase ALL into a single unified Core Competencies list.  
-- Keep every item.  
-- Use colon-style, ATS-friendly format.  
-- Return plain text bullets only (one per line)."""
-
-
-
-
-SYSTEM_JD_TO_JSON = """
-You are a job description parser.
-
-GOAL
-- Convert an unstructured IT Job Description into a clean JSON structure.
-- Keep it factual, no paraphrasing.
-- This makes it easier for downstream AI to extract keywords.
-
-OUTPUT FORMAT (STRICT JSON ONLY):
-{
-  "role_title": str,                // inferred job title or main role
-  "responsibilities": [str],        // each duty/action as one sentence
-  "requirements": [str],            // hard requirements like tools, skills, experience
-  "preferred": [str],               // optional or nice-to-have
-  "technologies": [str],            // explicit tools, platforms, languages mentioned
-  "methodologies": [str]            // explicit practices/methodologies mentioned
-}
-
-RULES
-- Preserve wording but split into structured lists.
-- Do not add commentary or drop details.
-- JSON only, no extra text.
-"""
-
-USER_JD_TO_JSON = """
-JOB DESCRIPTION (verbatim):
-{jd}
-
-TASK:
-Convert this JD into the strict JSON schema. No extra text.
-"""
 
 # -----------------------------
 # Legacy sample resume prompts (kept for compatibility)
@@ -421,23 +320,3 @@ USER_CONTACTS = """RESUME:
 {resume}
 
 Return JSON only."""
-
-SYSTEM_GAPS = """You are an assistant that identifies missing skills/technologies."""
-USER_GAPS = """Job Description:
-{jd}
-
-Resume:
-{resume}
-
-Top Keywords (ranked + variants):
-{keywords}
-
-Task:
-1. Compare the Top Keywords list against the Resume content.  
-2. If a keyword (or any of its variants) is missing in the Resume, mark it as a GAP.  
-3. Return strict JSON:
-
-{{
-  "gaps": ["keyword1", "keyword2", "keyword3"]
-}}
-"""

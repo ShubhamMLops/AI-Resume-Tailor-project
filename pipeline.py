@@ -278,21 +278,93 @@ def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
 
 
 # -----------------------------
-# Keyword Sentences
+# Keyword Sentences -> now returns structured Technical Skills (heading -> list)
 # -----------------------------
 def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: List[str],
                                provider_pref: Optional[str], model_name: Optional[str],
                                temperature: float, max_tokens: int, keys: Dict[str, str]) -> str:
+    """
+    Generate a grouped Technical Skills block for insertion into the resume.
+    This function asks the LLM to return a JSON mapping: { "skills": { "Cloud Computing": ["AWS","EC2"], ... } }
+    Then it converts that JSON into a human-readable block:
+
+    Technical Skills
+    Cloud Computing: AWS, EC2, S3
+    Databases: MySQL, PostgreSQL
+    ...
+
+    We intentionally REMOVE any 'Core Competencies' output and instead structure everything under Technical Skills.
+    """
     provider = _provider_from_keys(provider_pref, keys or {})
-    kw_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
-    resp = provider.chat(
-        model=model_name,
-        system=SYSTEM_KEYWORD_SENTENCES,
-        user=USER_KEYWORD_SENTENCES.format(jd=jd_text, resume=resume_text, keywords=kw_blob),
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
-    return sanitize_markdown(resp or "").strip()
+
+    # If no explicit target keywords passed, try to use gaps (caller may compute them), but we accept empty list.
+    kws_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
+
+    # Ask the LLM for a JSON mapping of grouped skills
+    user_prompt = USER_KEYWORD_SENTENCES.format(jd=(jd_text or ""), resume=(resume_text or ""), keywords=kws_blob)
+    raw = provider.chat(model=model_name, system=SYSTEM_KEYWORD_SENTENCES, user=user_prompt, temperature=temperature, max_tokens=max_tokens or 600)
+    raw = (raw or "").strip().strip("`").strip()
+    # Try to extract JSON block
+    skills_obj = {}
+    try:
+        start = raw.find('{'); end = raw.rfind('}') + 1
+        if start >= 0 and end > start:
+            skills_obj = json.loads(raw[start:end])
+        else:
+            # If LLM didn't return strict JSON, try to parse line-by-line headings: "Heading: a, b, c"
+            skills_obj = {"skills": {}}
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                if ":" in ln:
+                    h, vals = ln.split(":", 1)
+                    items = [v.strip() for v in re.split(r",|\u2022", vals) if v.strip()]
+                    skills_obj["skills"][h.strip()] = items
+    except Exception:
+        # fallback: try to parse free text into one heading
+        try:
+            # take everything as a single Technical Skills line
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            if lines:
+                skills_obj = {"skills": {"Technical Skills": []}}
+                for ln in lines:
+                    if ":" in ln:
+                        h, vals = ln.split(":", 1)
+                        items = [v.strip() for v in re.split(r",|\u2022", vals) if v.strip()]
+                        skills_obj["skills"][h.strip()] = items
+                    else:
+                        # add individual tokens
+                        tokens = [t.strip() for t in re.split(r",|\u2022|\s{2,}", ln) if t.strip()]
+                        skills_obj["skills"]["Technical Skills"].extend(tokens)
+        except Exception:
+            skills_obj = {"skills": {}}
+
+    # Normalize the skills object and build text block
+    skills = skills_obj.get("skills") or {}
+    # If empty, fallback to target_keywords grouped under "Technical Skills"
+    if not skills:
+        if target_keywords:
+            skills = {"Technical Skills": list(dict.fromkeys(target_keywords))}
+        else:
+            skills = {}
+
+    # Build a readable block
+    out_lines = []
+    out_lines.append("Technical Skills")
+    for heading, items in skills.items():
+        # skip any accidental 'Core Competencies' headings (we must remove core competencies)
+        if heading.strip().lower().startswith("core"):
+            continue
+        # normalize items
+        items_arr = []
+        for it in items or []:
+            if isinstance(it, str) and it.strip():
+                items_arr.append(it.strip())
+        if items_arr:
+            out_lines.append(f"{heading}: {', '.join(items_arr)}")
+
+    return "\n".join(out_lines).strip()
 
 def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
                              provider_pref: Optional[str], model_name: Optional[str],
@@ -313,8 +385,90 @@ def polish_core_competencies(original_bullets: str, new_bullets: str,
     return sanitize_markdown(raw or "").strip()
 
 # -----------------------------
-# Summary Bullets
+# Technical Skills insertion utility
 # -----------------------------
+def _remove_core_competencies_section(text: str) -> str:
+    """
+    Remove the first Core Competencies section (heading + body) if present.
+    """
+    if not text:
+        return text
+    pattern = re.compile(r"(?im)^\s*core[\s\-_:]*competencies\s*[:\-–—]?\s*$")
+    m = pattern.search(text)
+    if not m:
+        return text
+    start = m.start()
+    end = m.end()
+    after = text[end:]
+    nxt = re.search(r"(?im)^\s*(skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
+    block_end = end + (nxt.start() if nxt else len(after))
+    return (text[:start] + text[block_end:]).strip()
+
+def insert_technical_skills(full_text: str, skills_block: str) -> str:
+    """
+    Ensure Core Competencies is removed and Technical Skills section is inserted or replaced.
+    skills_block is a plain text block starting with "Technical Skills" followed by lines "Heading: item, item"
+    """
+    if not full_text:
+        return full_text
+    text = full_text
+
+    # 1) Remove Core Competencies entirely
+    text = _remove_core_competencies_section(text)
+
+    # 2) Normalize skills_block
+    lines = [ln.rstrip() for ln in (skills_block or "").splitlines() if ln.strip()]
+    if not lines:
+        # nothing to insert; simply remove core competencies and return
+        return text
+
+    # If the skills_block already starts with "Technical Skills", keep as-is, else try to wrap
+    if lines[0].strip().lower().startswith("technical"):
+        block = "\n".join(lines).strip()
+    else:
+        # wrap the whole block under Technical Skills heading
+        block = "Technical Skills\n" + "\n".join(lines).strip()
+
+    # 3) Replace existing Technical Skills if present
+    pattern = re.compile(r"(?im)^\s*technical\s*skills\s*[:\-–—]?\s*$")
+    m = pattern.search(text or "")
+    if m:
+        start = m.start()
+        end = m.end()
+        after = text[end:]
+        nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications|profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$", after)
+        section_end = end + (nxt.start() if nxt else len(after))
+        head = text[:end].rstrip()
+        tail = text[section_end:].lstrip("\n")
+        new_text = (head + "\n" + block + "\n\n" + tail).strip()
+        return new_text
+    else:
+        # If no Technical Skills heading, try to insert after Summary or after Contact block (first non-empty line)
+        # Insert after Summary if exists
+        summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
+        m2 = summary_heading_re.search(text)
+        if m2:
+            # find end of summary section
+            head_end = m2.end()
+            after = text[head_end:]
+            nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
+            insert_pos = head_end + (nxt.start() if nxt else len(after))
+            new_text = text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip()
+            return new_text
+        else:
+            # fallback: insert near the top after first non-empty line
+            parts = text.splitlines()
+            idx = 0
+            while idx < len(parts) and not parts[idx].strip():
+                idx += 1
+            insert_at = min(len(parts), idx + 1)
+            new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
+            return "\n".join(new_lines).strip()
+
+# -----------------------------
+# Keyword Sentences Polishing (left as-is)
+# -----------------------------
+
 def generate_summary_bullets(resume_text: str, jd_text: str, focus: str,
                              provider_pref: Optional[str], model_name: Optional[str],
                              temperature: float, max_tokens: int, keys: Dict[str, str]) -> str:
@@ -332,7 +486,7 @@ def bulletize_summary_preserve_meaning(summary_text: str,
     return sanitize_markdown(raw or "").strip()
 
 # -----------------------------
-# Render JSON -> text
+# Render JSON -> text (unchanged)
 # -----------------------------
 def _limit_words(s: str, max_words: int = 22) -> str:
     parts = s.split()
@@ -460,6 +614,7 @@ github={contacts.get('github','')}"""
 def replace_core_competencies(full_text: str, new_bullets: str) -> str:
     """
     Replace 'Core Competencies' section with new bullets
+    (Kept for backward compatibility but NOT used in the new flow.)
     """
     new_bullets = (new_bullets or "").strip()
     if not new_bullets: return full_text

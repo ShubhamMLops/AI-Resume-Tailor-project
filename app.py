@@ -12,7 +12,8 @@ from pipeline import (
     extract_ats_llm_from_optimizer,
     generate_keyword_sentences,
     generate_summary_bullets,
-    bulletize_summary_preserve_meaning,   # <-- add this
+    bulletize_summary_preserve_meaning,
+    insert_technical_skills,            # NEW: function to insert/update Technical Skills
 )
 
 
@@ -371,9 +372,6 @@ if resume_text.strip() and jd_text.strip():
         with st.expander("🔍 Raw Extraction from LLM"):
             st.text(kw_obj["_raw_extraction"])
 
-
-
-
     def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
         """
         Extract true skill gaps: tools/technologies from JD not already in Top Keywords.
@@ -498,185 +496,88 @@ if resume_text.strip() and jd_text.strip():
 
 
     # -----------------
-    # Keyword Sentence Generator (ATS-friendly) — SEPARATE EDITOR
+    # Keyword Sentence Generator (ATS-friendly) — now produces Technical Skills headings
     # -----------------
-    st.subheader("Keyword Sentence Generator (ATS-friendly)")
-    st.caption("Generates concise 'Core Competencies' bullets using Top Keywords (ranked) + Gaps. Edit here and Save; Tailor will blend them in.")
+    st.subheader("Keyword Sentence Generator (ATS → Technical Skills)")
+    st.caption("Generates grouped Technical Skills headings using Top Keywords (ranked) + Gaps. Edit here and Save; Tailor will insert/update Technical Skills section.")
 
     col_gen, col_clear = st.columns([1,1])
     with col_gen:
-        if st.button("Generate ATS-friendly keyword sentences", key="btn_kw_sentences_generate"):
+        if st.button("Generate Technical Skills (LLM)", key="btn_kw_sentences_generate"):
             if not kw_obj:
                 st.warning("Please run the LLM Keyword Optimizer first.")
             else:
-                # Build a full list and classify present/new (variants-aware)
-                TOKEN_RE = re.compile(r"[A-Za-z0-9#+.]+")
-                def _tok_seq_local2(s: str):
-                    return [t.lower() for t in TOKEN_RE.findall(s or "")]
-                def _canon_local2(s: str) -> str:
-                    return " ".join(_tok_seq_local2(s))
-
-                ranked_terms = []
-                for it in (kw_obj.get("keywords") or []):
-                    term = (it.get("term") or "").strip()
-                    if term:
-                        ranked_terms.append(term)
-
-                gaps_terms = list(kw_obj.get("missing") or [])
-                if not gaps_terms:
-                    try:
-                        fallback_missing, _fw = _fallback_missing_and_weak(kw_obj, resume_text, jd_text)
-                    except Exception:
-                        fallback_missing = []
-                    gaps_terms = list(kw_obj.get("missing") or [])
-
-                seen, target_all = set(), []
-                for t in ranked_terms + gaps_terms:
-                    c = _canon_local2(t)
-                    if c and c not in seen:
-                        seen.add(c)
-                        target_all.append(t)
-
-                variants_map = {}
-                for it in (kw_obj.get("keywords") or []):
-                    term = (it.get("term") or "").strip()
-                    if not term:
-                        continue
-                    forms = [term] + [v for v in (it.get("variants") or []) if v and v.strip()]
-                    expanded = set()
-                    for f in forms:
-                        f = f.strip()
-                        if not f:
-                            continue
-                        expanded.add(f)
-                        expanded.add(f.replace("-", " "))
-                        expanded.add(f.replace("/", " "))
-                    variants_map[_canon_local2(term)] = list(expanded)
-
-                presence_text = (st.session_state.get("tailored_edit") or resume_text or "")
-                text_tokens = _tok_seq_local2(presence_text)
-
-                def _has_seq(tokens, cand: str) -> bool:
-                    seq = _tok_seq_local2(cand)
-                    L = len(seq)
-                    if L == 0:
-                        return False
-                    for i in range(0, len(tokens) - L + 1):
-                        if tokens[i:i+L] == seq:
-                            return True
-                    if L == 1 and len(seq[0]) > 3:
-                        w = seq[0]
-                        alt = w[:-1] if w.endswith("s") else w + "s"
-                        return (w in tokens) or (alt in tokens)
-                    return False
-
-                # Directly pick from Optimizer outputs
-                present_keywords = [item.get("term", "").strip()
-                                    for item in (kw_obj.get("keywords") or [])
-                                    if (item.get("term") or "").strip()]
-
-                # Safely read gaps (fallback to "missing" if gaps not present)
-                # NEW: Use extract_gaps (deterministic) instead of kw_obj["gaps"]
+                # Build target keywords (gaps) using deterministic extract_gaps
                 try:
                     new_keywords = extract_gaps(resume_text, kw_obj)
                 except Exception:
                     new_keywords = []
 
-                new_keywords = [kw.strip() for kw in new_keywords if kw and kw.strip()]
+                # If extract_gaps found nothing, fall back to kw_obj['missing'] or top keywords
+                if not new_keywords:
+                    new_keywords = list(kw_obj.get("missing") or [])
 
+                # If still empty, use top N ranked keywords as candidates
+                if not new_keywords:
+                    new_keywords = [it.get("term","") for it in (kw_obj.get("keywords") or [])][:12]
 
-
-                with st.expander("🔍 New keywords for your resume (not currently found)", expanded=True):
-                    st.write(", ".join(new_keywords) if new_keywords else "— none —")
-                with st.expander("✅ Already present (will NOT be generated again)", expanded=False):
-                    st.write(", ".join(present_keywords) if present_keywords else "— none —")
-
-                target_for_sentences = new_keywords
-
-                if not target_for_sentences:
-                    st.info("All optimizer keywords already appear in the resume. Nothing to add.")
-                else:
-                    bullets_raw = generate_keyword_sentences(
-                        resume_text=presence_text,
+                # Generate a structured skills JSON / text using the LLM
+                try:
+                    # generate_keyword_sentences will ask the LLM for a JSON mapping {heading: [skills]}
+                    skills_text = generate_keyword_sentences(
+                        resume_text=resume_text,
                         jd_text=jd_text,
-                        target_keywords=target_for_sentences,
+                        target_keywords=new_keywords,
                         provider_pref=provider,
                         model_name=(model or None),
                         temperature=temperature,
                         max_tokens=min(max_tokens, 900),
                         keys=keys
                     )
-
-                    try:
-                        polished = polish_keyword_sentences(
-                            resume_text=presence_text,
-                            bullets_text=(bullets_raw or "").strip(),
-                            jd_text=jd_text,
-                            provider_pref=provider,
-                            model_name=(model or None),
-                            temperature=temperature,
-                            max_tokens=min(max_tokens, 800),
-                            keys=keys
-                        )
-                        out_text = polished
-                    except Exception:
-                        out_text = (bullets_raw or "")
-
-                    TOKEN_RE2 = re.compile(r"[A-Za-z0-9#+.]+")
-                    def _canon_line(s: str) -> str:
-                        return " ".join(t.lower() for t in TOKEN_RE2.findall(s or ""))
-
-                    seen_lines, lines_out = set(), []
-                    for ln in (out_text.splitlines() if out_text else []):
-                        s = ln.strip()
-                        if not s:
-                            continue
-                        c = _canon_line(s)
-                        if c in seen_lines:
-                            continue
-                        seen_lines.add(c)
-                        if not s.startswith("• "):
-                            s = "• " + s.lstrip("-").lstrip("•").strip()
-                        lines_out.append(s)
-
-                    st.session_state["kw_sentences_edit"] = "\n".join(lines_out).strip()
-                    st.success("Generated ATS-friendly keyword sentences. Review below, edit, then click Save.")
+                    # skills_text is a readable block like:
+                    # Technical Skills
+                    # Cloud Computing: AWS, EC2, S3
+                    # Databases: MySQL, PostgreSQL
+                    st.session_state["kw_sentences_edit"] = skills_text or ""
+                    st.success("Generated Technical Skills block. Edit below and Save.")
+                except Exception as e:
+                    st.error(str(e))
 
     with col_clear:
-        if st.button("Clear keyword sentences", key="btn_kw_sentences_clear"):
+        if st.button("Clear technical skills", key="btn_kw_sentences_clear"):
             st.session_state["kw_sentences_edit"] = ""
             st.session_state["kw_sentences_saved_text"] = ""
-            st.info("Keyword sentences cleared.")
+            st.info("Technical skills cleared.")
 
-    kw_edit = st.text_area("Keyword Sentences (editable, plain text)", key="kw_sentences_edit", height=220)
+    kw_edit = st.text_area("Technical Skills (editable, plain text; will be inserted under 'Technical Skills')", key="kw_sentences_edit", height=220)
 
-    if st.button("💾 Save keyword sentences", key="btn_kw_sentences_save"):
+    if st.button("💾 Save technical skills", key="btn_kw_sentences_save"):
         st.session_state["kw_sentences_saved_text"] = (kw_edit or "").strip()
-        st.success("Saved. Tailor with LLM will integrate these into the resume.")
+        st.success("Saved. Tailor with LLM will integrate these into the resume (under 'Technical Skills').")
 
     # -----------------
-    # Tailor with LLM (API-only) — integrates ONLY Resume + SAVED Keyword Sentences
+    # Tailor with LLM (API-only) — integrates ONLY Resume + SAVED Technical Skills text
     # -----------------
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    st.caption("Integrates your Resume + SAVED Keyword Sentence Generator text so it reads like original experience (no copy-paste feel), avoids duplicates, and refines existing mentions.")
+    st.caption("Integrates your Resume + SAVED Technical Skills so it reads like original experience (no copy-paste feel), avoids duplicates, and refines existing mentions. NOTE: Core Competencies section will be removed and replaced by Technical Skills.")
 
     if st.button("Generate tailored resume", type="primary", key="btn_tailor_generate"):
         if not resume_text.strip():
             st.warning("Please paste or upload your resume text first.")
         else:
             try:
-                # 1) Read SAVED keyword sentences
-                saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
+                # 1) Read SAVED technical skills text (heading + grouped lines)
+                saved_skills_block = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
 
-                # 2) Split & clean
-                raw_lines = [ln.strip() for ln in (saved_kw_sentences.splitlines() if saved_kw_sentences else [])]
+                # 2) Split & clean saved skill lines
+                raw_lines = [ln.rstrip() for ln in (saved_skills_block.splitlines() if saved_skills_block else [])]
                 raw_lines = [ln for ln in raw_lines if ln]
 
-                # 3) Decide: add vs refine (NO placement logic here)
+                # 3) Integration: we will provide the saved Technical Skills block to the tailor flow as "new_bullets"
                 lines_to_add, refine_hints, seen_lines = [], [], set()
                 for ln in raw_lines:
-                    ln_clean = ln.lstrip("•").lstrip("-").strip()
+                    ln_clean = ln.strip()
                     if not ln_clean:
                         continue
                     c = _canon(ln_clean)
@@ -687,8 +588,6 @@ if resume_text.strip() and jd_text.strip():
                     if _present_line(resume_text, ln_clean):
                         refine_hints.append(ln_clean)
                     else:
-                        if not ln_clean.startswith("• "):
-                            ln_clean = "• " + ln_clean
                         lines_to_add.append(ln_clean)
 
                 # 4) Build input for LLM: base resume + integration notes (AI places content)
@@ -697,22 +596,23 @@ if resume_text.strip() and jd_text.strip():
                     guidance = [
                         "",
                         "Integration Notes (for model):",
-                        "- Integrate the following without duplicating existing content.",
-                        "- If a theme already exists, refine in-place; do not add a new line.",
-                        "- Choose the most appropriate existing section (e.g., Core Competencies/Skills, Technical Skills, or a relevant role).",
+                        "- Integrate the provided Technical Skills block into the resume.",
+                        "- Remove any existing 'Core Competencies' section entirely before insertion.",
+                        "- If a 'Technical Skills' section already exists, replace it with the provided block.",
+                        "- If no 'Technical Skills' heading exists, insert one after the 'Technical Skills' or after 'Education' if not present.",
                         "- NEVER place added lines at the very top of the document or the very end.",
-                        "- Treat ALL added lines below as 'Core Competencies' content; do NOT place them under Work Experience or Projects.",
+                        "- Do not duplicate facts already present in the resume; refine existing mentions instead.",
                     ]
                     if refine_hints:
-                        guidance += ["", "Refine these existing themes:"]
+                        guidance += ["", "Refine these existing themes (do not duplicate):"]
                         guidance += [f"- {h}" for h in refine_hints]
                     if lines_to_add:
-                        guidance += ["", "Add these lines naturally (responsibility-style):"]
+                        guidance += ["", "Add or replace with these Technical Skills lines (preserve grouping/heading):"]
                         guidance += lines_to_add
                     blocks.append("\n".join(guidance))
 
                 base_resume_for_llm = "\n\n".join(blocks).strip()
-                
+
                 # --- Freeze summary position with placeholders (keep heading intact) ---
                 orig_summary_block = _extract_existing_summary_block(resume_text)
                 resume_frozen, has_summary = _insert_summary_placeholders(base_resume_for_llm)
@@ -742,7 +642,6 @@ if resume_text.strip() and jd_text.strip():
 
                 final_txt = sanitize_markdown(tailored)
 
-                
                 # --- Role-aligned bullet Summary via LLM ---
                 if has_summary and orig_summary_block.strip():
                     bullets_text = generate_summary_bullets(
@@ -761,27 +660,10 @@ if resume_text.strip() and jd_text.strip():
                 # Remove any leftover placeholders just in case
                 final_txt = final_txt.replace(_SUMMARY_START_PH, "\n").replace(_SUMMARY_END_PH, "\n")
 
-                # --- Strict Core Competencies (merge + polish) ---
-                saved_kw_sentences = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
-                orig_core_block = _extract_core_competencies_block(resume_text)
-                st.write("🔍 Extracted Core Competencies from resume:", orig_core_block)   # <--- ADD HERE
-
-                if orig_core_block or saved_kw_sentences:
-                    from pipeline import polish_core_competencies, replace_core_competencies
-                    polished_core = polish_core_competencies(
-                        original_bullets=orig_core_block,
-                        new_bullets=saved_kw_sentences,
-                        provider_pref=provider,
-                        model_name=(model or None),
-                        temperature=temperature,
-                        max_tokens=min(max_tokens, 900),
-                        keys=keys,
-                    )
-                    if polished_core:
-                        final_txt = replace_core_competencies(final_txt, polished_core)
-
-
-
+                # --- Insert/Replace Technical Skills (remove Core Competencies) ---
+                saved_skills_block = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
+                if saved_skills_block:
+                    final_txt = insert_technical_skills(final_txt, saved_skills_block)
 
                 # Persist to editor
                 st.session_state["tailored_text"] = final_txt
@@ -789,13 +671,13 @@ if resume_text.strip() and jd_text.strip():
                 st.session_state["tailored_saved"] = False
 
                 if lines_to_add and refine_hints:
-                    st.success("Tailored resume generated. New keyword sentences were integrated naturally and existing mentions were refined. Review and click Save before exporting.")
+                    st.success("Tailored resume generated. Technical Skills inserted and existing mentions refined. Review and click Save before exporting.")
                 elif lines_to_add:
-                    st.success("Tailored resume generated. Your keyword sentences were integrated without duplicates. Review and click Save before exporting.")
+                    st.success("Tailored resume generated. Technical Skills inserted. Review and click Save before exporting.")
                 elif refine_hints:
-                    st.success("Tailored resume generated. Existing keyword mentions were refined (no duplicates added). Review and click Save before exporting.")
+                    st.success("Tailored resume generated. Existing mentions refined (no duplicates added). Review and click Save before exporting.")
                 else:
-                    st.info("No new keyword sentences found and nothing specific to refine. The resume was still tailored for structure and clarity.")
+                    st.info("No new Technical Skills detected; resume tailored for structure and clarity.")
             except Exception as e:
                 st.error(str(e))
 
