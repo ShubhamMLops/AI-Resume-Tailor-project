@@ -1,7 +1,9 @@
-import io, os, json, re
+import io
+import os
+import json
+import re
 import streamlit as st
 from utils import export_docx, export_pdf
-from pipeline import extract_gaps
 from pipeline import (
     analyze,
     tailor,
@@ -13,9 +15,9 @@ from pipeline import (
     generate_keyword_sentences,
     generate_summary_bullets,
     bulletize_summary_preserve_meaning,
-    insert_technical_skills,            # NEW: function to insert/update Technical Skills
+    insert_technical_skills_after_summary,
+    extract_gaps,
 )
-
 
 # -------------------------
 # Stable editor/download state
@@ -42,12 +44,6 @@ def _canon(s: str) -> str:
     return " ".join(_tok_seq(s))
 
 def _present_line(base_text: str, line: str) -> bool:
-    """
-    True if 'line' already exists in the resume:
-      - exact token sequence
-      - compacted match (e.g., CI/CD -> cicd)
-      - simple plural/singular for single word >3 chars
-    """
     base_tokens = _tok_seq(base_text)
     base_compact = "".join(base_tokens)
     kt = _tok_seq(line)
@@ -67,27 +63,15 @@ def _present_line(base_text: str, line: str) -> bool:
     return False
 
 # -------------------------
-# Replace/insert Summary as bullets
+# Summary helpers
 # -------------------------
-KNOWN_HEADINGS = [
-    "Profile Summary", "Professional Summary", "Summary",
-    "Core Skills", "Core Competencies", "Skills", "Technical Skills",
-    "Work Experience", "Experience", "Projects", "Education",
-    "Certifications", "Achievements", "Publications", "Awards"
-]
-# Accept headings with optional punctuation (colon/dash)
 _HEADING_RE = r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$"
-_NEXT_HEADING_RE = r"(?im)^\s*(profile\s*summary|professional\s*summary|summary|core\s*skills|core\s*competencies|skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$"
+_NEXT_HEADING_RE = r"(?im)^\s*(profile\s*summary|professional\s*summary|summary|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$"
 
-# Placeholders used to freeze summary position during tailoring
 _SUMMARY_START_PH = "\n<<<KEEP_SUMMARY_POSITION_START>>>\n"
 _SUMMARY_END_PH   = "\n<<<KEEP_SUMMARY_POSITION_END>>>\n"
+
 def _find_summary_bounds(text: str):
-    """
-    Return (head_start, head_end, block_end, heading_text) for the first Summary section.
-    head_* are the bounds for heading line; block_end is end of the entire section body.
-    If not found, return (-1, -1, -1, "").
-    """
     if not text:
         return -1, -1, -1, ""
     m = re.search(_HEADING_RE, text)
@@ -101,26 +85,17 @@ def _find_summary_bounds(text: str):
     return head_start, head_end, block_end, heading_text
 
 def _insert_summary_placeholders(full_text: str):
-    """
-    Replace ONLY the Summary BODY with placeholders, keep the heading line intact.
-    Returns (text_with_placeholders, found: bool)
-    """
     hs, he, be, _ = _find_summary_bounds(full_text or "")
     if hs < 0:
         return full_text, False
     head = full_text[:he]
     body = full_text[he:be]
     tail = full_text[be:]
-    # Keep the heading; replace the body with placeholders
     return (head.rstrip() + _SUMMARY_START_PH + _SUMMARY_END_PH + tail.lstrip("\n")), True
 
 def _replace_placeholders_with_bullets(full_text: str, bullets_block: str) -> str:
-    """
-    Replace the placeholder region with the provided bullets (normalized to '• ').
-    """
     if not full_text:
         return full_text
-    # Normalize bullets
     lines = []
     for ln in (bullets_block or "").splitlines():
         s = ln.strip()
@@ -130,35 +105,12 @@ def _replace_placeholders_with_bullets(full_text: str, bullets_block: str) -> st
             s = "• " + s.lstrip("-").lstrip("•").strip()
         lines.append(s)
     block = "\n".join(lines).strip()
-    # Stitch in place
     if _SUMMARY_START_PH in full_text and _SUMMARY_END_PH in full_text:
         return full_text.replace(_SUMMARY_START_PH, "\n").replace(_SUMMARY_END_PH, "\n" + block + "\n", 1).replace(_SUMMARY_END_PH, "")
     return full_text
 
-def _remove_summary_section(text: str) -> str:
-    """
-    Remove the first Profile/Professional/Summary section (heading + body),
-    leaving the rest unchanged. Used so tailor() cannot rewrite the summary.
-    """
-    t = text or ""
-    m = m = re.search(_HEADING_RE, t)
-    if not m:
-        return t
-    start_h = m.start()
-    end_h   = m.end()
-    after = t[end_h:]
-    next_h = re.search(_NEXT_HEADING_RE, after)
-
-    end_block = end_h + (next_h.start() if next_h else len(after))
-    return (t[:start_h] + t[end_block:]).strip()
-
 def _extract_existing_summary_block(resume_text: str) -> str:
-    """
-    Return the raw text inside the first Summary section (Profile/Professional/Summary),
-    excluding the heading line and up to the next section heading.
-    """
     txt = resume_text or ""
-    headings_pattern = r"(?im)^(profile\s*summary|professional\s*summary|summary|core\s*skills|core\s*competencies|skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*$"
     m = re.search(_HEADING_RE, txt)
     if not m:
         return ""
@@ -169,82 +121,12 @@ def _extract_existing_summary_block(resume_text: str) -> str:
         return after[:n.start()].strip()
     return after.strip()
 
-def _extract_core_competencies_block(text: str) -> str:
-    """
-    Extract the body of the Core Competencies section (excluding heading).
-    Handles variations like 'CORE COMPETENCIES:', 'Core-Competencies', etc.
-    """
-    if not text:
-        return ""
-
-    # Match heading in multiple variations
-    pattern = re.compile(r"(?im)^\s*core[\s\-_:]*competencies\s*[:\-–—]?\s*$")
-    m = pattern.search(text)
-    if not m:
-        return ""
-
-    after = text[m.end():]
-
-    # Look for the next section heading
-    nxt = re.search(
-        r"(?im)^\s*(skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications|summary)\s*[:\-–—]?\s*$",
-        after
-    )
-
-    section_text = after[:nxt.start()].strip() if nxt else after.strip()
-    return section_text
-
-
-
-
-def _replace_summary_with_bullets(full_text: str, bullets_text: str) -> str:
-    """
-    Replace the first 'Profile Summary'/'Professional Summary' block with the new bullets.
-    If no summary heading exists, insert a 'Profile Summary' + bullets after the first non-empty line.
-    """
-    if not (full_text and bullets_text and bullets_text.strip()):
-        return full_text
-
-    # Normalize bullets to start with "• "
-    lines = []
-    for ln in bullets_text.splitlines():
-        s = ln.strip()
-        if not s:
-            continue
-        if not s.startswith("• "):
-            s = "• " + s.lstrip("-").lstrip("•").strip()
-        lines.append(s)
-    bullet_block = "\n".join(lines)
-
-    # Find summary heading case-insensitively
-    m = re.search(_HEADING_RE, full_text or "")
-    if m:
-        start = m.start()
-        end = m.end()
-        after = full_text[end:]
-        nxt = re.search(_NEXT_HEADING_RE, after)
-
-        section_end = end + (nxt.start() if nxt else len(after))
-        head = full_text[:end].rstrip()  # keep the heading line
-        tail = full_text[section_end:].lstrip("\n")
-        return (head + "\n" + bullet_block + "\n\n" + tail).strip()
-
-    # If there is no summary heading, insert after the first non-empty line
-    parts = (full_text or "").splitlines()
-    idx = 0
-    while idx < len(parts) and not parts[idx].strip():
-        idx += 1
-    insert_at = min(len(parts), idx + 1)
-    new_lines = parts[:insert_at] + ["", "Profile Summary", bullet_block, ""] + parts[insert_at:]
-    return "\n".join(new_lines).strip()
-
-
 # -------------------------
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="API-only Resume Tailor (v8 final)", page_icon="🧰", layout="wide")
 st.title("🧰 API-only Resume Tailor (v8 final)")
-st.caption("v8 layout • Full content read • Colored headings in DOCX/PDF • Plain-text output (no ##/**)")
+st.caption("Technical Skills will be inserted after Profile Summary")
 
 # -------------------------
 # Sidebar
@@ -276,7 +158,6 @@ def read_textarea_or_file(label: str, key_text: str, key_file: str) -> str:
             try:
                 from pdfminer.high_level import extract_text
             except Exception:
-                # some envs use slightly different import path; fallback above usually works
                 from pdfminer.high_level import extract_text
             import tempfile
             try:
@@ -309,7 +190,6 @@ with col2:
     st.subheader("Job Description")
     jd_text = read_textarea_or_file("Job Description", "jd_text", "jd_file")
 
-# Always use text boxes as source of truth
 resume_text = st.session_state.get("resume_text", "") or resume_text
 jd_text = st.session_state.get("jd_text", "") or jd_text
 
@@ -372,103 +252,12 @@ if resume_text.strip() and jd_text.strip():
         with st.expander("🔍 Raw Extraction from LLM"):
             st.text(kw_obj["_raw_extraction"])
 
-    def _fallback_missing_and_weak(kw_obj, resume_text, jd_text):
-        """
-        Extract true skill gaps: tools/technologies from JD not already in Top Keywords.
-        No verbs or filler words.
-        """
-        gap_terms = []
-        try:
-            # Capture capitalized tech terms / acronyms from JD
-            jd_tokens = re.findall(r"\b[A-Z][A-Za-z0-9+\-_/]{2,}\b", jd_text)
-            jd_tokens = [t for t in jd_tokens if len(t) > 2]
-
-            # Already covered keywords
-            seen_keywords = { (item.get("term") or "").lower() for item in (kw_obj.get("keywords") or []) }
-
-            # Filter out those already present
-            gap_terms = [t for t in jd_tokens if t.lower() not in seen_keywords]
-
-            # Deduplicate and sort
-            gap_terms = sorted(set(gap_terms))
-        except Exception:
-            gap_terms = []
-
-        # Weak terms: keep existing logic (or leave empty if you don’t want it at all)
-        weak_terms = []
-        return gap_terms, weak_terms
-
-
-    # Build target keywords from Optimizer (ranked + gaps), deduped, excluding ones already in resume
-    def build_target_keywords_from_optimizer(kw_obj, resume_text: str, jd_text: str):
-        if not kw_obj:
-            return []
-
-        token_re = re.compile(r"[A-Za-z0-9#+.]+")
-
-        def _canon_local(s: str) -> str:
-            return " ".join(t.lower() for t in token_re.findall(s or ""))
-
-        def _tok_seq_local(s: str):
-            return [t.lower() for t in token_re.findall(s or "")]
-
-        resume_tokens = _tok_seq_local(resume_text)
-        resume_compact = "".join(resume_tokens)
-
-        def _present(term: str) -> bool:
-            kt = _tok_seq_local(term)
-            if not kt:
-                return False
-            L = len(kt)
-            for i in range(0, len(resume_tokens) - L + 1):
-                if resume_tokens[i:i+L] == kt:
-                    return True
-            k_comp = "".join(kt)
-            if k_comp and k_comp in resume_compact:
-                return True
-            if L == 1 and len(kt[0]) > 3:
-                base = kt[0]
-                alt = base[:-1] if base.endswith("s") else base + "s"
-                if base in resume_tokens or alt in resume_tokens:
-                    return True
-            return False
-
-        outlets_ordered = []
-        for item in (kw_obj.get("keywords") or []):
-            base = (item.get("term") or "").strip()
-            if not base:
-                continue
-            variants = [v.strip() for v in (item.get("variants") or []) if v and v.strip()]
-            outlets_ordered.append(base)
-            outlets_ordered.extend(variants)
-
-        gaps_terms = list(kw_obj.get("missing") or [])
-        for g in gaps_terms:
-            g = (g or "").strip()
-            if g:
-                outlets_ordered.append(g)
-
-        seen, deduped = set(), []
-        for t in outlets_ordered:
-            c = _canon_local(t)
-            if c and c not in seen:
-                seen.add(c)
-                deduped.append(t)
-
-        target = [t for t in deduped if not _present(t)]
-        return target
-
     if kw_obj:
         st.write(kw_obj.get("summary",""))
         colk1, colk2 = st.columns(2)
         with colk1:
             st.markdown("**Top Keywords (ranked)**")
-
-            # make sure kw_obj is dict and has 'keywords'
-            keywords = []
-            if isinstance(kw_obj, dict):
-                keywords = kw_obj.get("keywords", [])
-
+            keywords = kw_obj.get("keywords", []) if isinstance(kw_obj, dict) else []
             if keywords and isinstance(keywords, list):
                 for item in keywords:
                     term = item.get("term", "").strip()
@@ -483,7 +272,6 @@ if resume_text.strip() and jd_text.strip():
                 st.error("⚠️ No parsed keywords available from LLM.")
                 st.text("=== RAW JSON FROM LLM ===\n" + str(kw_obj.get("_raw_json", "")))
 
-
         with colk2:
             st.markdown("**Gaps**")
             try:
@@ -493,13 +281,11 @@ if resume_text.strip() and jd_text.strip():
             st.write("Gaps:", ", ".join(gaps) if gaps else "—")
             st.caption("🔍 These are Top Keywords missing from your resume.")
 
-
-
     # -----------------
-    # Keyword Sentence Generator (ATS-friendly) — now produces Technical Skills headings
+    # Generate Technical Skills (grouped)
     # -----------------
-    st.subheader("Keyword Sentence Generator (ATS → Technical Skills)")
-    st.caption("Generates grouped Technical Skills headings using Top Keywords (ranked) + Gaps. Edit here and Save; Tailor will insert/update Technical Skills section.")
+    st.subheader("Generate Technical Skills (LLM)")
+    st.caption("Produces grouped Technical Skills headings + keywords (will be inserted after Profile Summary).")
 
     col_gen, col_clear = st.columns([1,1])
     with col_gen:
@@ -507,23 +293,15 @@ if resume_text.strip() and jd_text.strip():
             if not kw_obj:
                 st.warning("Please run the LLM Keyword Optimizer first.")
             else:
-                # Build target keywords (gaps) using deterministic extract_gaps
                 try:
                     new_keywords = extract_gaps(resume_text, kw_obj)
                 except Exception:
                     new_keywords = []
-
-                # If extract_gaps found nothing, fall back to kw_obj['missing'] or top keywords
                 if not new_keywords:
                     new_keywords = list(kw_obj.get("missing") or [])
-
-                # If still empty, use top N ranked keywords as candidates
                 if not new_keywords:
                     new_keywords = [it.get("term","") for it in (kw_obj.get("keywords") or [])][:12]
-
-                # Generate a structured skills JSON / text using the LLM
                 try:
-                    # generate_keyword_sentences will ask the LLM for a JSON mapping {heading: [skills]}
                     skills_text = generate_keyword_sentences(
                         resume_text=resume_text,
                         jd_text=jd_text,
@@ -534,10 +312,6 @@ if resume_text.strip() and jd_text.strip():
                         max_tokens=min(max_tokens, 900),
                         keys=keys
                     )
-                    # skills_text is a readable block like:
-                    # Technical Skills
-                    # Cloud Computing: AWS, EC2, S3
-                    # Databases: MySQL, PostgreSQL
                     st.session_state["kw_sentences_edit"] = skills_text or ""
                     st.success("Generated Technical Skills block. Edit below and Save.")
                 except Exception as e:
@@ -549,32 +323,27 @@ if resume_text.strip() and jd_text.strip():
             st.session_state["kw_sentences_saved_text"] = ""
             st.info("Technical skills cleared.")
 
-    kw_edit = st.text_area("Technical Skills (editable, plain text; will be inserted under 'Technical Skills')", key="kw_sentences_edit", height=220)
+    kw_edit = st.text_area("Technical Skills (editable, plain text; will be inserted after Profile Summary)", key="kw_sentences_edit", height=220)
 
     if st.button("💾 Save technical skills", key="btn_kw_sentences_save"):
         st.session_state["kw_sentences_saved_text"] = (kw_edit or "").strip()
-        st.success("Saved. Tailor with LLM will integrate these into the resume (under 'Technical Skills').")
+        st.success("Saved. Tailor will insert these under 'Technical Skills' immediately after Profile Summary.")
 
     # -----------------
-    # Tailor with LLM (API-only) — integrates ONLY Resume + SAVED Technical Skills text
+    # Tailor with LLM
     # -----------------
     st.divider()
     st.subheader("Tailor with LLM (API-only)")
-    st.caption("Integrates your Resume + SAVED Technical Skills so it reads like original experience (no copy-paste feel), avoids duplicates, and refines existing mentions. NOTE: Core Competencies section will be removed and replaced by Technical Skills.")
+    st.caption("Integrates your Resume + SAVED Technical Skills; Core Competencies will be removed and Technical Skills inserted after Profile Summary.")
 
     if st.button("Generate tailored resume", type="primary", key="btn_tailor_generate"):
         if not resume_text.strip():
             st.warning("Please paste or upload your resume text first.")
         else:
             try:
-                # 1) Read SAVED technical skills text (heading + grouped lines)
                 saved_skills_block = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
-
-                # 2) Split & clean saved skill lines
                 raw_lines = [ln.rstrip() for ln in (saved_skills_block.splitlines() if saved_skills_block else [])]
                 raw_lines = [ln for ln in raw_lines if ln]
-
-                # 3) Integration: we will provide the saved Technical Skills block to the tailor flow as "new_bullets"
                 lines_to_add, refine_hints, seen_lines = [], [], set()
                 for ln in raw_lines:
                     ln_clean = ln.strip()
@@ -584,50 +353,38 @@ if resume_text.strip() and jd_text.strip():
                     if c in seen_lines:
                         continue
                     seen_lines.add(c)
-
                     if _present_line(resume_text, ln_clean):
                         refine_hints.append(ln_clean)
                     else:
                         lines_to_add.append(ln_clean)
 
-                # 4) Build input for LLM: base resume + integration notes (AI places content)
                 blocks = [resume_text.strip()]
                 if refine_hints or lines_to_add:
                     guidance = [
                         "",
                         "Integration Notes (for model):",
-                        "- Integrate the provided Technical Skills block into the resume.",
                         "- Remove any existing 'Core Competencies' section entirely before insertion.",
-                        "- If a 'Technical Skills' section already exists, replace it with the provided block.",
-                        "- If no 'Technical Skills' heading exists, insert one after the 'Technical Skills' or after 'Education' if not present.",
+                        "- Replace existing 'Technical Skills' if present; otherwise insert new 'Technical Skills' immediately after 'Profile Summary'.",
                         "- NEVER place added lines at the very top of the document or the very end.",
-                        "- Do not duplicate facts already present in the resume; refine existing mentions instead.",
                     ]
                     if refine_hints:
                         guidance += ["", "Refine these existing themes (do not duplicate):"]
                         guidance += [f"- {h}" for h in refine_hints]
                     if lines_to_add:
-                        guidance += ["", "Add or replace with these Technical Skills lines (preserve grouping/heading):"]
+                        guidance += ["", "Add/replace with these Technical Skills lines (preserve grouping/heading):"]
                         guidance += lines_to_add
                     blocks.append("\n".join(guidance))
 
                 base_resume_for_llm = "\n\n".join(blocks).strip()
-
-                # --- Freeze summary position with placeholders (keep heading intact) ---
                 orig_summary_block = _extract_existing_summary_block(resume_text)
                 resume_frozen, has_summary = _insert_summary_placeholders(base_resume_for_llm)
-
-                # Strengthen the instruction to the model in the integration notes
                 if "Integration Notes (for model):" in resume_frozen:
                     resume_frozen += (
                         "\n- DO NOT move or delete the markers '<<<KEEP_SUMMARY_POSITION_START>>>' "
                         "and '<<<KEEP_SUMMARY_POSITION_END>>>'."
-                        "\n- Keep the exact section order as provided."
                     )
 
                 override_contacts = st.session_state.get("override_contacts")
-
-                # Tailor the resume WITHOUT letting the model touch the frozen summary body
                 tailored = tailor(
                     resume_frozen,
                     jd_text,
@@ -642,40 +399,40 @@ if resume_text.strip() and jd_text.strip():
 
                 final_txt = sanitize_markdown(tailored)
 
-                # --- Role-aligned bullet Summary via LLM ---
                 if has_summary and orig_summary_block.strip():
                     bullets_text = generate_summary_bullets(
-                        resume_text=orig_summary_block,   # only the original summary text
-                        jd_text=jd_text,                  # align wording to the role
+                        resume_text=orig_summary_block,
+                        jd_text=jd_text,
                         focus="summary",
                         provider_pref=provider,
                         model_name=(model or None),
                         temperature=temperature,
-                        max_tokens=min(max_tokens, 1000),  # allow longer bullets
+                        max_tokens=min(max_tokens, 1000),
                         keys=keys,
                     )
                     if bullets_text:
                         final_txt = _replace_placeholders_with_bullets(final_txt, bullets_text)
 
-                # Remove any leftover placeholders just in case
+                # after you have final_txt and have replaced summary placeholders:
                 final_txt = final_txt.replace(_SUMMARY_START_PH, "\n").replace(_SUMMARY_END_PH, "\n")
 
-                # --- Insert/Replace Technical Skills (remove Core Competencies) ---
+                # Insert saved technical skills block (if any)
                 saved_skills_block = (st.session_state.get("kw_sentences_saved_text", "") or "").strip()
                 if saved_skills_block:
-                    final_txt = insert_technical_skills(final_txt, saved_skills_block)
+                    # insert_technical_skills_after_summary comes from pipeline.py
+                    final_txt = insert_technical_skills_after_summary(final_txt, saved_skills_block)
 
-                # Persist to editor
+
                 st.session_state["tailored_text"] = final_txt
                 st.session_state["tailored_edit"]  = final_txt
                 st.session_state["tailored_saved"] = False
 
                 if lines_to_add and refine_hints:
-                    st.success("Tailored resume generated. Technical Skills inserted and existing mentions refined. Review and click Save before exporting.")
+                    st.success("Tailored resume generated. Technical Skills inserted after Profile Summary and existing mentions refined.")
                 elif lines_to_add:
-                    st.success("Tailored resume generated. Technical Skills inserted. Review and click Save before exporting.")
+                    st.success("Tailored resume generated. Technical Skills inserted after Profile Summary.")
                 elif refine_hints:
-                    st.success("Tailored resume generated. Existing mentions refined (no duplicates added). Review and click Save before exporting.")
+                    st.success("Tailored resume generated. Existing mentions refined (no duplicates added).")
                 else:
                     st.info("No new Technical Skills detected; resume tailored for structure and clarity.")
             except Exception as e:
@@ -739,7 +496,6 @@ if resume_text.strip() and jd_text.strip():
             )
             st.session_state["final_ats_llm"] = ats_llm
 
-            # Deterministic reconciliation (token/variant aware + compact match)
             token_re = re.compile(r"[A-Za-z0-9#+.]+")
             def _canon_local3(s: str) -> str:
                 return " ".join(t.lower() for t in token_re.findall(s or ""))
@@ -823,7 +579,6 @@ if resume_text.strip() and jd_text.strip():
                 "coverage": coverage,
             }
 
-    # Display ATS results
     ats_llm = st.session_state.get("final_ats_llm")
     if ats_llm:
         c1, c2 = st.columns([1, 2])
@@ -838,7 +593,7 @@ if resume_text.strip() and jd_text.strip():
                 term = s.get("term","")
                 if term in miss:
                     shown = True
-                    st.write(f"• {term} → {s.get('section','Core Competencies')}: {s.get('how','')}")
+                    st.write(f"• {term} → {s.get('section','Technical Skills')}: {s.get('how','')}")
             if not shown:
                 st.write("—")
 

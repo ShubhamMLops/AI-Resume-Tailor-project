@@ -514,16 +514,7 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
     if obj.get("summary"):
         section("Profile Summary"); lines += [obj["summary"].strip(), ""]
 
-    if obj.get("core_skills"):
-        section("Core Skills")
-        for s in obj["core_skills"]: lines.append("• " + s)
-        lines.append("")
-
-    if obj.get("core_competencies"):
-        section("Core Competencies")
-        for s in obj["core_competencies"]: lines.append("• " + s)
-        lines.append("")
-
+    # place technical_skills here if present (tailor JSON)
     ts = obj.get("technical_skills")
     if ts:
         section("Technical Skills")
@@ -580,6 +571,98 @@ def render_text_from_json(obj: Dict[str, Any]) -> str:
         lines.append("")
 
     return sanitize_markdown("\n".join(lines))
+
+def _remove_technical_skills_section(text: str) -> str:
+    """
+    Remove an existing 'Technical Skills' section entirely (heading + body).
+    """
+    if not text:
+        return text
+    pattern = re.compile(r"(?im)^\s*technical[\s\-_:]*skills\s*[:\-–—]?\s*$")
+    m = pattern.search(text)
+    if not m:
+        return text
+    start = m.start()
+    end = m.end()
+    after = text[end:]
+    nxt = re.search(
+        r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications|profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$",
+        after
+    )
+    block_end = end + (nxt.start() if nxt else len(after))
+    return (text[:start] + text[block_end:]).strip()
+
+# -----------------------------
+# Remove Core Competencies + insert technical block
+# -----------------------------
+def _remove_core_competencies_section(text: str) -> str:
+    """
+    Remove a 'Core Competencies' section entirely (heading + body).
+    """
+    if not text:
+        return text
+    pattern = re.compile(r"(?im)^\s*core[\s\-_:]*competencies\s*[:\-–—]?\s*$")
+    m = pattern.search(text)
+    if not m:
+        return text
+    start = m.start()
+    end = m.end()
+    after = text[end:]
+    # find next section heading to mark end of block
+    nxt = re.search(
+        r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$",
+        after
+    )
+    block_end = end + (nxt.start() if nxt else len(after))
+    return (text[:start] + text[block_end:]).strip()
+
+
+def insert_technical_skills_after_summary(full_text: str, skills_block: str) -> str:
+    """
+    Ensure exactly one Technical Skills block: remove Core Competencies and any existing
+    Technical Skills sections, then insert the supplied skills_block immediately after
+    the Profile Summary (or after name/contacts if no summary).
+    """
+    if not full_text:
+        return full_text
+
+    text = full_text
+
+    # Remove Core Competencies and existing Technical Skills to avoid duplicates
+    text = _remove_core_competencies_section(text)
+    text = _remove_technical_skills_section(text)
+
+    # Normalize skills_block into lines and skip if empty
+    lines = [ln.rstrip() for ln in (skills_block or "").splitlines() if ln.strip()]
+    if not lines:
+        return text
+
+    # If the user supplied a heading "Technical Skills" already, keep as-is; else add heading
+    if lines[0].strip().lower().startswith("technical"):
+        block = "\n".join(lines).strip()
+    else:
+        block = "Technical Skills\n" + "\n".join(lines).strip()
+
+    # Find the Profile Summary heading location
+    summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
+    m = summary_heading_re.search(text)
+    if m:
+        # Insert after the existing summary block (end of its body)
+        head_end = m.end()
+        after = text[head_end:]
+        nxt = re.search(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
+        insert_pos = head_end + (nxt.start() if nxt else len(after))
+        new_text = text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip()
+        return new_text
+
+    # If no Profile Summary heading, insert after first non-empty line (name/contacts)
+    parts = text.splitlines()
+    idx = 0
+    while idx < len(parts) and not parts[idx].strip():
+        idx += 1
+    insert_at = min(len(parts), idx + 1)
+    new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
+    return "\n".join(new_lines).strip()
 
 # -----------------------------
 # Tailor (JSON-first, fallback)

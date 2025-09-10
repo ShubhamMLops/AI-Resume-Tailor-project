@@ -159,12 +159,11 @@ Return JSON with this exact schema:
 }
 
 REQUIREMENTS
-- Group related skills under meaningful headings (e.g., "Cloud Computing", "Databases", "Containerization", "DevOps Tools", "CI/CD", "Infrastructure as Code", "Monitoring & Observability").
+- Group related skills under meaningful headings (e.g., Cloud Computing, Databases, DevOps Tools).
 - Place the highest priority keywords from the provided list into the most relevant headings.
-- Do NOT produce 'Core Competencies' as a heading. Everything belongs under 'skills' headings.
-- Do not invent unrelated technologies; use resume + provided keywords only. If the list is small, group under "Technical Skills".
-- Each skill value must be a short token (no long sentences).
-- Return strict JSON only — no explanatory text.
+- Do NOT produce 'Core Competencies' as a heading.
+- Do not invent unrelated technologies; use resume + provided keywords only.
+- Return strict JSON only.
 """
 
 USER_KEYWORD_SENTENCES = """
@@ -178,7 +177,7 @@ TARGET_KEYWORDS:
 {keywords}
 
 TASK:
-Return a JSON object with a 'skills' mapping (heading -> list of skills) following the schema specified by the system prompt.
+Return a JSON object with a 'skills' mapping (heading -> list of skills) following the system schema.
 """
 
 # === Polish Keyword Sentences (kept for compatibility) ===
