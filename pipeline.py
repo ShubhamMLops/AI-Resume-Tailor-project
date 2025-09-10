@@ -156,12 +156,19 @@ def analyze(resume_text: str, jd_text: str) -> Dict[str, Any]:
 def extract_keywords_llm(resume_text: str, jd_text: str,
                          provider_pref: Optional[str], model_name: Optional[str],
                          temperature: float, max_tokens: int, keys: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Run LLM keyword extractor using SYSTEM_KEYWORDS, then strictly filter so ONLY
+    terms/variants that actually appear in the JD remain.
+    Domain-agnostic; no stoplist or domain-specific heuristics.
+    Returns obj with 'keywords' filtered and '_filtered_out' listing removed entries.
+    """
     provider = _provider_from_keys(provider_pref, keys)
 
-    # --- if JD is empty, return empty result immediately ---
-    if not jd_text.strip():
-        return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": ""}
+    # If JD is empty, return a clean empty structure immediately
+    if not (jd_text and jd_text.strip()):
+        return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": "", "_filtered_out": []}
 
+    # call LLM
     raw = provider.chat(
         model=model_name,
         system=SYSTEM_KEYWORDS,
@@ -193,10 +200,100 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     obj["summary"] = obj.get("summary", "")
     obj["_raw_json"] = raw
 
-    # Enforce deterministic JD → keywords relationship
+    # prepare JD tokens for strict matching (domain-agnostic)
+    token_re = re.compile(r"[A-Za-z0-9#+.]+")
+    jd_tokens = [t.lower() for t in token_re.findall(jd_text or "")]
+    jd_compact = "".join(jd_tokens)
+    jd_token_set = set(jd_tokens)
+
+    def _tok_seq(s: str):
+        return [t.lower() for t in token_re.findall(s or "")]
+
+    def _sequential_match(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        L = len(seq_tokens)
+        for i in range(0, len(jd_tokens) - L + 1):
+            if jd_tokens[i:i+L] == seq_tokens:
+                return True
+        return False
+
+    def _all_tokens_present(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        return all(tok in jd_token_set for tok in seq_tokens)
+
+    def _compact_match(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        return "".join(seq_tokens) in jd_compact
+
+    def _present_in_jd_strict(seq_tokens: List[str]) -> bool:
+        """
+        Strict presence rules (domain-agnostic):
+        - single token: sequential OR compact match
+        - multi-token: sequential OR all tokens present OR compact match
+        """
+        if not seq_tokens:
+            return False
+        if len(seq_tokens) == 1:
+            return _sequential_match(seq_tokens) or _compact_match(seq_tokens)
+        # multi-word
+        if _sequential_match(seq_tokens):
+            return True
+        if _all_tokens_present(seq_tokens):
+            return True
+        if _compact_match(seq_tokens):
+            return True
+        return False
+
+    filtered_keywords = []
+    filtered_out = []
+
+    for kw in (obj.get("keywords") or []):
+        term = (kw.get("term") or "").strip()
+        variants = [v for v in (kw.get("variants") or []) if v and v.strip()]
+
+        kept = False
+
+        # Check term itself (strict)
+        if term:
+            seq = _tok_seq(term)
+            if _present_in_jd_strict(seq):
+                kept = True
+
+        # Check variants (strict)
+        if not kept:
+            for v in variants:
+                seqv = _tok_seq(v)
+                if _present_in_jd_strict(seqv):
+                    kept = True
+                    break
+
+        if kept:
+            safe_kw = {
+                "rank": kw.get("rank"),
+                "term": term,
+                "category": kw.get("category", ""),
+                "variants": variants
+            }
+            filtered_keywords.append(safe_kw)
+        else:
+            filtered_out.append({"term": term, "variants": variants, "reason": "not_in_jd"})
+
+    # Replace keywords with filtered list; clear 'missing' so deterministic gaps function is used later.
+    obj["keywords"] = filtered_keywords
+    obj["missing"] = []
+    obj["weak"] = obj.get("weak", []) if isinstance(obj.get("weak", []), list) else []
+    obj["_filtered_out"] = filtered_out
+
+    # enforce_jd_keywords kept for compatibility if you use it
     obj = enforce_jd_keywords(obj, jd_text, resume_text)
 
     return obj
+
+
+
 
 
 def enforce_jd_keywords(obj, jd_text: str, resume_text: str):

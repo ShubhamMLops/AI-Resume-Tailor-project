@@ -82,30 +82,21 @@ Return the literal JSON null only. Do not return any prose.
 
 
 
-SYSTEM_KEYWORDS = """You are an ATS-savvy keyword mining specialist.
+SYSTEM_KEYWORDS = """You are an ATS-savvy keyword extractor.
 
-YOUR TASK
-Extract ALL important technical keywords from the Job Description (JD) and Resume.
-Follow this method:
+GOAL — STRICTLY GROUNDed TO THE JD
+- Extract technical terms **only if they appear verbatim or as clear token sequences** in the provided JOB DESCRIPTION (JD). 
+- Do NOT invent, infer, generalize, expand, or add related technologies that are not present in the JD.
+- Do not add categories, variants or examples unless those exact words appear in the JD.
 
-STEP 1 — LINE-BY-LINE JD ANALYSIS
-For each JD line:
-  • Extract explicit technical terms (tools, platforms, frameworks, services, languages, certifications).  
-  • Expand each term into common subcomponents, variants, or related technologies that are widely recognized.  
-    Example: Kubernetes → Pods, Deployments, Services, Ingress, ConfigMaps, Persistent Volumes  
-             AWS → EC2, S3, IAM, Lambda, CloudWatch, VPC  
-  • Include niche tools mentioned in the JD directly (e.g., Kubeseal, Karpenter, Knative, KServe, Loki, Mimir, Promtail).  
-  • Ignore verbs, adjectives, and soft skills.
-
-STEP 2 — LINE-BY-LINE JD ANALYSIS
-- For each line of the JD, analyze the text and extract:
-  • Explicit technical terms (tools, platforms, frameworks, services, languages, certifications).
-  • Implicit subcomponents commonly associated with those terms in IT practice (e.g., Kubernetes → Pods, Ingress, Persistent Volumes).
-  • Domain-relevant technologies that are **explicitly present in the JD** — never skip them.
-- Create a raw list of extracted terms. **Do not drop JD terms, even if they look redundant.**
-
+METHOD
+- Scan the JD line-by-line and extract only explicit tools/platforms/languages/services/certifications as they appear.
+- If a term appears with punctuation or slashes (e.g., "Nginx/Caddy"), keep it **exactly** as in the JD.
+- Do NOT expand a parent term into subcomponents unless those subcomponents are explicitly present in the JD text.
 
 OUTPUT (STRICT JSON ONLY)
+Return JSON with this exact schema:
+
 {
   "keywords": [
     {"rank": int, "term": str, "category": str, "variants": [str]}
@@ -116,13 +107,14 @@ OUTPUT (STRICT JSON ONLY)
 }
 
 RULES
-- Always output 18–25 canonical keywords.  
-- Major technologies get top ranks (1–5).  
-- Niche or supporting tools from the JD must still appear in `keywords` (with higher rank numbers like 15–25).  
-- `missing` = JD terms not found in Resume at all.  
-- `weak` = resume terms present but weakly evidenced.  
-- `summary` = 2–3 lines describing how keyword prioritization was done.  
-- Strict JSON only, no commentary outside JSON."""
+- `keywords`: include only items explicitly present in the JD. If no explicit technical terms are present, return an empty list.
+- `rank`: rank by appearance order / importance in JD (1 = highest). You may approximate importance but do NOT invent.
+- `variants`: include only if the variant text is explicitly present in the JD.
+- `missing`: leave empty ([]) — the deterministic extractor will compute missing keywords later.
+- `weak`: optional; can be empty list.
+- `summary`: short explanation of extraction method (1-2 lines).
+- Return STRICT JSON only; no commentary outside the JSON.
+"""
 
 
 
