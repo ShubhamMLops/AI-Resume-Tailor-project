@@ -158,6 +158,10 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                          temperature: float, max_tokens: int, keys: Dict[str, str]) -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
 
+    # --- if JD is empty, return empty result immediately ---
+    if not jd_text.strip():
+        return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": ""}
+
     raw = provider.chat(
         model=model_name,
         system=SYSTEM_KEYWORDS,
@@ -179,13 +183,21 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         obj["_parse_error"] = str(e)
         obj["_raw_json"] = raw
 
-    if "keywords" not in obj or not isinstance(obj["keywords"], list):
+    # normalize schema
+    if not isinstance(obj.get("keywords"), list):
         obj["keywords"] = []
+    if not isinstance(obj.get("missing"), list):
+        obj["missing"] = []
+    if not isinstance(obj.get("weak"), list):
+        obj["weak"] = []
     obj["summary"] = obj.get("summary", "")
     obj["_raw_json"] = raw
 
+    # Enforce deterministic JD → keywords relationship
     obj = enforce_jd_keywords(obj, jd_text, resume_text)
+
     return obj
+
 
 def enforce_jd_keywords(obj, jd_text: str, resume_text: str):
     """
@@ -226,11 +238,13 @@ def enforce_jd_keywords(obj, jd_text: str, resume_text: str):
 # -----------------------------
 def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
     """
-    Compare Top Keywords (LLM JSON) vs Resume text.
-    Return keywords that are missing in resume.
+    Improved gaps extraction:
+    - Build candidate list from kw_obj['keywords'] (term + variants), preserve rank order.
+    - Normalize and dedupe candidates (collapse punctuation/spacing).
+    - Return only those candidates that are NOT present in resume (token-level/compact checks).
+    - Ignore tiny tokens and a small stoplist.
     """
-    keywords = kw_obj.get("keywords", [])
-    if not keywords:
+    if not kw_obj or not isinstance(kw_obj.get("keywords"), list) or len(kw_obj.get("keywords")) == 0:
         return []
 
     token_re = re.compile(r"[A-Za-z0-9#+.]+")
@@ -240,41 +254,77 @@ def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
     def _tok_seq(s: str):
         return [t.lower() for t in token_re.findall(s or "")]
 
-    def _present(term: str) -> bool:
-        seq = _tok_seq(term)
-        if not seq:
+    def _present(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
             return False
-        L = len(seq)
-        # check sequential match
+        L = len(seq_tokens)
+        # sequential token match
         for i in range(0, len(resume_tokens) - L + 1):
-            if resume_tokens[i:i+L] == seq:
+            if resume_tokens[i:i+L] == seq_tokens:
                 return True
-        # compact match (CI/CD -> cicd)
-        if "".join(seq) in resume_compact:
+        # compact match (ci/cd -> cicd)
+        if "".join(seq_tokens) in resume_compact:
             return True
-        # plural/singular match for single words
-        if L == 1 and len(seq[0]) > 3:
-            base = seq[0]
+        # singular/plural heuristic for single-word tokens
+        if L == 1 and len(seq_tokens[0]) > 3:
+            base = seq_tokens[0]
             alt = base[:-1] if base.endswith("s") else base + "s"
             if base in resume_tokens or alt in resume_tokens:
                 return True
         return False
 
-    # collect all terms from Top Keywords (term + variants)
-    all_terms = []
-    for item in keywords:
-        if item.get("term"):
-            base = item["term"]
-            all_terms.append(base)
-            # also add normalized versions
-            all_terms.append(base.replace("/", "").replace("-", ""))
-        for v in item.get("variants", []):
-            all_terms.append(v)
-            all_terms.append(v.replace("/", "").replace("-", ""))
+    # helper: normalize candidate for dedupe key (collapse punctuation/whitespace)
+    def _norm_key(s: str) -> str:
+        if not s:
+            return ""
+        k = re.sub(r"[^A-Za-z0-9]+", " ", s).strip().lower()
+        k = re.sub(r"\s+", " ", k)
+        return k
 
-    # filter those missing in resume
-    gaps = [t for t in set(all_terms) if t and not _present(t)]
-    return sorted(set(gaps))
+    stoplist = {"open-source"}  # add any noisy tokens you want ignored (normalized form)
+
+    # Build ordered candidate list (preserve keyword rank order, then variant order)
+    ordered_candidates = []
+    seen_keys = set()
+    for kw in (kw_obj.get("keywords") or []):
+        term = (kw.get("term") or "").strip()
+        variants = kw.get("variants") or []
+        # primary term first
+        items = [term] + [v for v in variants if v and v.strip()]
+        for it in items:
+            key = _norm_key(it)
+            if not key:
+                continue
+            if key in seen_keys:
+                continue
+            # ignore very short tokens
+            if len(key) <= 2:
+                continue
+            if key in stoplist:
+                continue
+            seen_keys.add(key)
+            ordered_candidates.append({"orig": it.strip(), "key": key})
+
+    # Now check each candidate for presence in resume; if absent, include original display form
+    gaps = []
+    for cand in ordered_candidates:
+        seq = _tok_seq(cand["orig"])
+        # if normalization changed spacing/punctuation, but token seq empty, try from key:
+        if not seq:
+            seq = cand["key"].split()
+        if not _present(seq):
+            gaps.append(cand["orig"])
+
+    # final dedupe (just in case) preserving order
+    final = []
+    seen_final = set()
+    for g in gaps:
+        k = _norm_key(g)
+        if k not in seen_final:
+            seen_final.add(k)
+            final.append(g)
+
+    return final
 
 
 # -----------------------------

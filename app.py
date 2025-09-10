@@ -189,9 +189,27 @@ with col1:
 with col2:
     st.subheader("Job Description")
     jd_text = read_textarea_or_file("Job Description", "jd_text", "jd_file")
+# --- Step 3: Clear optimizer cache if JD changed interactively ---
+_prev_jd = st.session_state.get("_prev_jd_for_kw", "")
+if (jd_text or "").strip() != (_prev_jd or "").strip():
+    st.session_state.pop("kw_llm", None)
+    st.session_state.pop("final_ats_llm", None)
+    st.session_state.pop("ai_contacts", None)
+    st.session_state["_prev_jd_for_kw"] = jd_text or ""
+
 
 resume_text = st.session_state.get("resume_text", "") or resume_text
 jd_text = st.session_state.get("jd_text", "") or jd_text
+# --- Reset keyword optimizer caches if JD changed ---
+_prev_jd = st.session_state.get("_prev_jd_for_kw", "")
+if (jd_text or "").strip() != (_prev_jd or "").strip():
+    # JD changed — clear previous keyword optimizer outputs so nothing is reused
+    st.session_state.pop("kw_llm", None)
+    st.session_state.pop("final_ats_llm", None)
+    st.session_state.pop("ai_contacts", None)
+    # store latest JD for future change detection
+    st.session_state["_prev_jd_for_kw"] = jd_text or ""
+
 
 # -------------------------
 # Main
@@ -237,14 +255,26 @@ if resume_text.strip() and jd_text.strip():
     st.subheader("LLM Keyword Optimizer")
     if st.button("Extract ranked keywords with AI", key="btn_kw_extract"):
         try:
+            # Run extraction (always uses current jd_text variable)
             kw = extract_keywords_llm(
                 resume_text, jd_text,
                 provider_pref=provider, model_name=(model or None),
                 temperature=temperature, max_tokens=min(max_tokens, 1200), keys=keys
             )
+
+            # Overwrite session state with fresh results
             st.session_state["kw_llm"] = kw
+
+            # Record the JD used so future changes will clear the cache
+            st.session_state["_prev_jd_for_kw"] = jd_text or ""
+
+            # Clear downstream cached ATS results so they will be recomputed
+            st.session_state.pop("final_ats_llm", None)
+
+            st.success("Keywords extracted from the current JD.")
         except Exception as e:
             st.error(str(e))
+
 
     kw_obj = st.session_state.get("kw_llm")
 
