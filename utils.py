@@ -17,7 +17,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, KeepTogether, ListFlowable, ListItem, Image, Table, TableStyle
+    SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, Image, Table, TableStyle
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from reportlab.pdfbase import pdfmetrics
@@ -135,7 +135,10 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
     styles = doc.styles
     normal = styles["Normal"]
     normal.font.name = "Calibri"
-    normal._element.rPr.rFonts.set(qn('w:eastAsia'), 'Calibri')
+    try:
+        normal._element.rPr.rFonts.set(qn('w:eastAsia'), 'Calibri')
+    except Exception:
+        pass
     normal.font.size = Pt(11)
 
     # Heading style
@@ -203,17 +206,15 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
             p.style = hstyle
             p.add_run(content)
         elif t == "bullet":
-            p = doc.add_paragraph(content, style="List Bullet")
+            doc.add_paragraph(content, style="List Bullet")
         elif t == "hr":
-            p = doc.add_paragraph("_" * 60)
+            doc.add_paragraph("_" * 60)
         elif t == "para":
             doc.add_paragraph(content)
         else:  # blank
             doc.add_paragraph("")
 
     # --- Removed visible footer per request ---
-    # If you want a non-visible metadata timestamp, implement later using python-docx/pypdf metadata.
-
     doc.save(out_path)
     return out_path
 
@@ -240,8 +241,8 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
         parent=stylesheet["Normal"],
         fontName=BODY_FONT,
         fontSize=10.5,
-        leading=13,
-        spaceAfter=6,
+        leading=12,     # slightly tighter
+        spaceAfter=4,   # reduce spacing after paragraphs
         alignment=TA_LEFT
     )
     heading_style = ParagraphStyle(
@@ -251,8 +252,8 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
         fontSize=12.5,
         leading=14,
         textColor=HEADING_COLOR,
-        spaceBefore=8,
-        spaceAfter=6,
+        spaceBefore=6,
+        spaceAfter=4,
         alignment=TA_LEFT
     )
     small_italic = ParagraphStyle(
@@ -291,19 +292,19 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
                                      ("TOPPADDING", (0,0), (-1,-1), 0),
                                      ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
             story.append(tbl)
-            story.append(Spacer(1, 8))
+            story.append(Spacer(1, 6))
         except Exception:
             if title:
                 story.append(Paragraph(f"<b>{title}</b>", ParagraphStyle("Htitle", parent=heading_style, fontSize=16)))
             if contact:
                 story.append(Paragraph(contact, ParagraphStyle("ContactSmall", parent=body_style, fontSize=9)))
-            story.append(Spacer(1, 8))
+            story.append(Spacer(1, 6))
     else:
         if title:
             story.append(Paragraph(f"<b>{title}</b>", ParagraphStyle("Htitle", parent=heading_style, fontSize=16)))
         if contact:
             story.append(Paragraph(contact, ParagraphStyle("ContactSmall", parent=body_style, fontSize=9)))
-        story.append(Spacer(1, 8))
+        story.append(Spacer(1, 6))
 
     # Parse and create section boxes
     parsed = _parse_lines(text)
@@ -327,8 +328,9 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
             return
         items = [ListItem(Paragraph(b, body_style), leftIndent=6) for b in bullets_buf]
         lf = ListFlowable(items, bulletType="bullet", start="disc", leftIndent=12, bulletFontName=BODY_FONT)
-        story.append(KeepTogether(lf))
-        story.append(Spacer(1, 6))
+        # allow the list to split across pages instead of forcing KeepTogether
+        story.append(lf)
+        story.append(Spacer(1, 4))
         bullets_buf = []
 
     for typ, content in parsed[p_idx:]:
@@ -337,10 +339,10 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
             box = Table([[Paragraph(f"<b>{content}</b>", heading_style)]], colWidths=[usable_width])
             box.setStyle(TableStyle([
                 ("BACKGROUND", (0,0), (-1,-1), colors.whitesmoke),
-                ("LEFTPADDING", (0,0), (-1,-1), 8),
-                ("RIGHTPADDING", (0,0), (-1,-1), 8),
-                ("TOPPADDING", (0,0), (-1,-1), 6),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+                ("LEFTPADDING", (0,0), (-1,-1), 6),
+                ("RIGHTPADDING", (0,0), (-1,-1), 6),
+                ("TOPPADDING", (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
                 ("BOX", (0,0), (-1,-1), 0.4, colors.HexColor("#EEEEEE"))
             ]))
             story.append(box)
@@ -354,16 +356,13 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
         elif typ == "hr":
             flush_bullets_to_story()
             hr = Table([[""]], colWidths=[usable_width])
-            hr.setStyle(TableStyle([("LINEBELOW", (0,0), (-1,-1), 0.6, colors.HexColor("#DDDDDD"))]))
+            hr.setStyle(TableStyle([("LINEBELOW", (0,0), (-1,-1), 0.4, colors.HexColor("#DDDDDD"))]))
             story.append(hr)
-            story.append(Spacer(1, 6))
+            story.append(Spacer(1, 4))
         else:  # blank
             flush_bullets_to_story()
-            story.append(Spacer(1, 6))
+            story.append(Spacer(1, 4))
     flush_bullets_to_story()
-
-    # --- Visible footer removed per request ---
-    # If you want non-visible metadata instead, we can write PDF metadata separately.
 
     # Create document
     doc = SimpleDocTemplate(out_path, pagesize=A4,
