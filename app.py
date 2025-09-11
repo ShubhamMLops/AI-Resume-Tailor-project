@@ -482,33 +482,46 @@ if resume_text.strip() and jd_text.strip():
         st.session_state["tailored_saved"] = True
         st.success("Saved. Exports will use your edited text.")
 
+    # from utils import export_docx, export_pdf
+
     saved_text = (st.session_state.get("tailored_text", "") or "").strip()
     colx1, colx2 = st.columns(2)
 
-    # DOCX column
     with colx1:
         if not saved_text:
             st.info("Click Save to enable DOCX download.")
         else:
-            if st.button("Create DOCX for download", key="btn_make_docx"):
-                # create file on demand
-                out_path = export_docx(saved_text, None)  # let export_docx pick a safe path
-                with open(out_path, "rb") as f:
-                    data = f.read()
-                st.success("DOCX created.")
-                st.download_button("⬇️ Download DOCX", data, file_name=os.path.basename(out_path), mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_docx")
+            if st.button("Prepare DOCX for download", key="btn_make_docx"):
+                docx_bytes = export_docx(saved_text, out_path=None)  # returns bytes
+                st.session_state["_last_docx_bytes"] = docx_bytes
+                st.success("DOCX ready.")
+            docx_b = st.session_state.get("_last_docx_bytes")
+            if docx_b:
+                st.download_button(
+                    "⬇️ Download DOCX",
+                    data=docx_b,
+                    file_name="tailored_resume.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_docx"
+                )
 
-    # PDF column
     with colx2:
         if not saved_text:
             st.info("Click Save to enable PDF download.")
         else:
-            if st.button("Create PDF for download", key="btn_make_pdf"):
-                out_path = export_pdf(saved_text, None)  # generate file on demand
-                with open(out_path, "rb") as f:
-                    data = f.read()
-                st.success("PDF created.")
-                st.download_button("⬇️ Download PDF", data, file_name=os.path.basename(out_path), mime="application/pdf", key="dl_pdf")
+            if st.button("Prepare PDF for download", key="btn_make_pdf"):
+                pdf_bytes = export_pdf(saved_text, out_path=None)  # returns bytes
+                st.session_state["_last_pdf_bytes"] = pdf_bytes
+                st.success("PDF ready.")
+            pdf_b = st.session_state.get("_last_pdf_bytes")
+            if pdf_b:
+                st.download_button(
+                    "⬇️ Download PDF",
+                    data=pdf_b,
+                    file_name="tailored_resume.pdf",
+                    mime="application/pdf",
+                    key="dl_pdf"
+                )
 
 
     # -----------------

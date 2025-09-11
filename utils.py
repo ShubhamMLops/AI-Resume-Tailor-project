@@ -114,18 +114,20 @@ def _safe_filepath(basename: str, ext: str) -> str:
 # -------------------------
 # DOCX export (polished)
 # -------------------------
-def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[str] = None) -> str:
-    """
-    Export a polished DOCX. If out_path is None, will create a filename in OUT_DIR.
-    Optional logo_path places a small logo in header.
-    """
-    if not out_path:
-        out_path = _safe_filepath("tailored_resume", "docx")
+# add imports at top of file if not already:
+from io import BytesIO
 
+# Replace or add these functions in utils.py
+
+def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[str] = None):
+    """
+    Export DOCX. If out_path is None -> return bytes (in-memory).
+    If out_path provided -> write file and return out_path.
+    """
+    # create Document
     doc = Document()
     # set page margins
-    sections = doc.sections
-    for sec in sections:
+    for sec in doc.sections:
         sec.top_margin = Inches(0.6)
         sec.bottom_margin = Inches(0.6)
         sec.left_margin = Inches(0.7)
@@ -147,7 +149,6 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
         hstyle.font.name = "Calibri"
         hstyle.font.size = Pt(13)
         hstyle.font.bold = True
-        # color
         try:
             from docx.shared import RGBColor
             hstyle.font.color.rgb = RGBColor(0x1F, 0x4E, 0x79)
@@ -164,7 +165,6 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
         run.bold = True
         run.font.size = Pt(18)
         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        # small contact line
         if contact:
             p2 = doc.add_paragraph(contact.strip())
             p2.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
@@ -172,7 +172,7 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
             p2.runs[0].italic = True
         doc.add_paragraph()
 
-    # If logo_path provided, try to add as header image (left aligned)
+    # optional logo in header (preserve if provided)
     if logo_path and os.path.exists(logo_path):
         try:
             header = doc.sections[0].header
@@ -185,21 +185,16 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
 
     # Walk parsed lines and emit docx content
     parsed = _parse_lines(text)
-
-    # --- SKIP leading parsed lines that duplicate the title/contact we already printed ---
     start_idx = 0
-    # skip leading blanks
     while start_idx < len(parsed) and parsed[start_idx][0] == "blank":
         start_idx += 1
-    # if next line duplicates title, skip it (para or heading)
     if title and start_idx < len(parsed):
         ttype, tcontent = parsed[start_idx]
         if tcontent.strip() == title.strip():
             start_idx += 1
-            # also skip contact line if present next
             if start_idx < len(parsed) and parsed[start_idx][1].strip() == contact.strip():
                 start_idx += 1
-    # iterate from start_idx
+
     for t, content in parsed[start_idx:]:
         if t == "heading":
             p = doc.add_paragraph()
@@ -211,38 +206,37 @@ def export_docx(text: str, out_path: Optional[str] = None, logo_path: Optional[s
             doc.add_paragraph("_" * 60)
         elif t == "para":
             doc.add_paragraph(content)
-        else:  # blank
+        else:
             doc.add_paragraph("")
 
-    # --- Removed visible footer per request ---
-    doc.save(out_path)
-    return out_path
+    # If out_path provided -> save to disk; else return bytes
+    if out_path:
+        doc.save(out_path)
+        return out_path
 
-# -------------------------
-# PDF export (ReportLab) - high-quality layout
-# -------------------------
-def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[str] = None) -> str:
-    """
-    Export a high-quality PDF using ReportLab. If out_path is None, will create file in OUT_DIR.
-    Optionally include logo_path (file).
-    Visible footer (Generated...) has been removed by default.
-    """
-    if not out_path:
-        out_path = _safe_filepath("tailored_resume", "pdf")
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
 
+
+def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[str] = None):
+    """
+    Export PDF. If out_path is None -> return bytes (in-memory).
+    If out_path provided -> write file and return out_path.
+    """
     PAGE_WIDTH, PAGE_HEIGHT = A4
     margin = 18 * mm
     usable_width = PAGE_WIDTH - 2 * margin
 
-    # Styles
     stylesheet = getSampleStyleSheet()
     body_style = ParagraphStyle(
         "BodyX",
         parent=stylesheet["Normal"],
         fontName=BODY_FONT,
         fontSize=10.5,
-        leading=12,     # slightly tighter
-        spaceAfter=4,   # reduce spacing after paragraphs
+        leading=12,
+        spaceAfter=4,
         alignment=TA_LEFT
     )
     heading_style = ParagraphStyle(
@@ -256,24 +250,13 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
         spaceAfter=4,
         alignment=TA_LEFT
     )
-    small_italic = ParagraphStyle(
-        "SmallItal",
-        parent=stylesheet["Normal"],
-        fontName=BODY_FONT,
-        fontSize=8,
-        leading=9,
-        alignment=TA_CENTER
-    )
 
-    # Build story
     story = []
 
-    # Header: name/contact
     title, contact = _extract_title_and_contact(text)
 
     if logo_path and os.path.exists(logo_path):
         try:
-            # scale logo to ~48 px high
             pil = PILImage.open(logo_path)
             w, h = pil.size
             target_h = 48
@@ -306,10 +289,8 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
             story.append(Paragraph(contact, ParagraphStyle("ContactSmall", parent=body_style, fontSize=9)))
         story.append(Spacer(1, 6))
 
-    # Parse and create section boxes
     parsed = _parse_lines(text)
 
-    # --- SKIP leading parsed lines that duplicate the title/contact we already printed ---
     p_idx = 0
     while p_idx < len(parsed) and parsed[p_idx][0] == "blank":
         p_idx += 1
@@ -328,7 +309,6 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
             return
         items = [ListItem(Paragraph(b, body_style), leftIndent=6) for b in bullets_buf]
         lf = ListFlowable(items, bulletType="bullet", start="disc", leftIndent=12, bulletFontName=BODY_FONT)
-        # allow the list to split across pages instead of forcing KeepTogether
         story.append(lf)
         story.append(Spacer(1, 4))
         bullets_buf = []
@@ -359,16 +339,23 @@ def export_pdf(text: str, out_path: Optional[str] = None, logo_path: Optional[st
             hr.setStyle(TableStyle([("LINEBELOW", (0,0), (-1,-1), 0.4, colors.HexColor("#DDDDDD"))]))
             story.append(hr)
             story.append(Spacer(1, 4))
-        else:  # blank
+        else:
             flush_bullets_to_story()
             story.append(Spacer(1, 4))
     flush_bullets_to_story()
 
-    # Create document
-    doc = SimpleDocTemplate(out_path, pagesize=A4,
+    # Build into BytesIO if out_path is None
+    if out_path:
+        doc = SimpleDocTemplate(out_path, pagesize=A4,
+                                leftMargin=margin, rightMargin=margin,
+                                topMargin=margin, bottomMargin=margin)
+        doc.build(story)
+        return out_path
+
+    bio = BytesIO()
+    doc = SimpleDocTemplate(bio, pagesize=A4,
                             leftMargin=margin, rightMargin=margin,
                             topMargin=margin, bottomMargin=margin)
-
-    # Build without a printed footer
     doc.build(story)
-    return out_path
+    bio.seek(0)
+    return bio.getvalue()
