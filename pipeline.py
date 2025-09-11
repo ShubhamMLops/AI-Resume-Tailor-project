@@ -157,10 +157,15 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                          provider_pref: Optional[str], model_name: Optional[str],
                          temperature: float, max_tokens: int, keys: Dict[str, str]) -> Dict[str, Any]:
     """
-    Run LLM keyword extractor using SYSTEM_KEYWORDS, then strictly filter so ONLY
-    terms/variants that actually appear in the JD remain.
-    Domain-agnostic; no stoplist or domain-specific heuristics.
-    Returns obj with 'keywords' filtered and '_filtered_out' listing removed entries.
+    Run LLM keyword extractor, but post-filter results so that only terms/variants
+    that actually appear in the provided JD are kept.
+
+    Domain-agnostic behavior:
+    - No stoplist or domain-specific filtering.
+    - Strict presence rules:
+      * single-word: sequential token match OR compact match
+      * multi-word: exact sequential match OR all tokens present somewhere OR compact match
+    - Returns obj with 'keywords' filtered and '_filtered_out' listing removed entries.
     """
     provider = _provider_from_keys(provider_pref, keys)
 
@@ -168,7 +173,6 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     if not (jd_text and jd_text.strip()):
         return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": "", "_filtered_out": []}
 
-    # call LLM
     raw = provider.chat(
         model=model_name,
         system=SYSTEM_KEYWORDS,
@@ -190,7 +194,7 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         obj["_parse_error"] = str(e)
         obj["_raw_json"] = raw
 
-    # normalize schema
+    # Normalize schema keys
     if not isinstance(obj.get("keywords"), list):
         obj["keywords"] = []
     if not isinstance(obj.get("missing"), list):
@@ -200,7 +204,7 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     obj["summary"] = obj.get("summary", "")
     obj["_raw_json"] = raw
 
-    # prepare JD tokens for strict matching (domain-agnostic)
+    # --- prepare JD tokens for strict matching (domain-agnostic) ---
     token_re = re.compile(r"[A-Za-z0-9#+.]+")
     jd_tokens = [t.lower() for t in token_re.findall(jd_text or "")]
     jd_compact = "".join(jd_tokens)
@@ -281,17 +285,18 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         else:
             filtered_out.append({"term": term, "variants": variants, "reason": "not_in_jd"})
 
-    # Replace keywords with filtered list; clear 'missing' so deterministic gaps function is used later.
+    # Replace keywords with filtered list
     obj["keywords"] = filtered_keywords
+
+    # Reset 'missing' to avoid stale LLM values; use deterministic extract_gaps() for accurate gaps later.
     obj["missing"] = []
     obj["weak"] = obj.get("weak", []) if isinstance(obj.get("weak", []), list) else []
     obj["_filtered_out"] = filtered_out
 
-    # enforce_jd_keywords kept for compatibility if you use it
+    # Keep compatibility enforcement
     obj = enforce_jd_keywords(obj, jd_text, resume_text)
 
     return obj
-
 
 
 
