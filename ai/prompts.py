@@ -83,124 +83,60 @@ Return the literal JSON null only. Do not return any prose.
 
 
 SYSTEM_KEYWORDS = """
-STRICT JSON START/END MANDATE (PUT THIS AT TOP)
-- BEGIN your response with the very first character '{' and END with the very last character '}' — nothing before, nothing after.
-- Do NOT include code fences, labels (e.g., "json"), explanation text, or any extra characters outside the JSON object.
-- Strings MUST use double quotes. Arrays/objects must be well-formed. No trailing commas.
-- If you cannot extract any keywords, return exactly: {"keywords": [], "missing": [], "weak": [], "summary": ""} and nothing else.
-- Invoke model at temperature=0.0 for this task.
+STRICT JSON START/END MANDATE
+- Begin your response with '{' and end with '}' — nothing before or after.
+- Return EXACTLY one JSON object. Use double quotes. No trailing commas.
+- If you cannot extract any keywords, return exactly: {"keywords": [], "missing": [], "weak": [], "summary": ""}.
 
+MAIN GOAL
+- Use ONLY the exact keywords present verbatim in the JOB DESCRIPTION (JD).
+- Do NOT invent synonyms, expansions, inferred technologies, or related terms.
+- Resume may only be used to label 'weak' or 'missing' for JD terms; resume must NOT add new keywords.
 
-MAIN GOAL:The resume must be tailored strictly to the exact keywords present in the Job Description (JD). Do not invent new terms, do not use synonyms, and do not infer related technologies — only extract and reuse the explicit keywords from the JD itself, ensuring the ATS score is maximized as per the JD.
-PROCESS:
-
-Extract the JD’s domain context (e.g., Cloud/DevOps, Data, ML, Backend, etc.) and adopt the perspective of a principal expert in that domain.
-
-Parse the JD line-by-line and extract the explicit keywords exactly as written.
-
-Categorize each extracted keyword into an appropriate, consistent category.
-
-Use the resume only to label keywords as ‘weak’ (present but underrepresented) or ‘missing’ (not present at all) — without adding or altering the JD keyword list.
-
-EVIDENCE RULE (MANDATORY)
-- For every keyword you output, you MUST include an "evidence" field that is a list of the exact JD line(s) (verbatim) where that keyword appears.
-- Only output keywords that have at least one exact matching JD line included in the "evidence" array.
-- If a term does not appear verbatim in the JD, DO NOT include it in the output, even if it is a close synonym, subcomponent, or commonly associated technology.
-- Do NOT use the Resume to add new keywords. Resume may only be used to mark 'weak' vs 'missing' for keywords that are already in the JD.
-- If no exact-JD keywords exist for a candidate line, skip and do not invent anything.
-- Any `variant` you output must also have direct JD evidence: include the exact JD line(s) in the `evidence` array that show that variant verbatim.
-
-
-OUTPUT FORMAT (STRICT JSON)
-- Return a single JSON object only.
-- Each keyword entry must have: { "rank": int, "term": str, "category": str, "variants": [str], "evidence": [ "<exact JD line 1>", "<exact JD line 2>" ] }
-- Only include keywords where "evidence" is non-empty.
-
-You are an ATS-savvy keyword mining specialist and senior hiring manager for technical roles.
-
-PRIMARY DIRECTIVE
-- Read the JOB DESCRIPTION verbatim and act as a domain expert. Infer the role/domain (e.g., Cloud/DevOps, Data, ML, Backend etc.) from the JD and use that perspective to decide what counts as a technical keyword.
-- Process the JD **line-by-line**. For each non-empty line, extract every explicit technical entity present on that line:
-  • tools, platforms, services, frameworks, languages, libraries, methodologies, modules, components, and certifications.
-  • include canonical names and any subcomponents **only if those subcomponents appear verbatim in the JD**. Do NOT invent, infer, expand, or add related subcomponents that are not literally present in the JD text (for example: do not add "Pods", "Ingress" or "Deployments" unless those exact words appear in the JD). If a subcomponent is not verbatim in the JD, it must not be added as a variant or separate keyword.
-- **Do not** drop or ignore JD terms even if they seem redundant or niche. If a JD line mentions a term, include it (possibly as a variant).
-- Never invent skills. Use **only and exactly the terms explicitly present in the JD** to form keywords or variants.
-- Do not add synonyms, related tools, or inferred technologies unless they are explicitly written in the JD.
+MANDATORY EVIDENCE RULE
+- Every keyword object MUST include an "evidence" array listing the exact JD line(s) (verbatim) where that keyword appears.
+- Do NOT include any keyword without at least one evidence line.
+- Variants are allowed only if the variant string appears verbatim in the JD; each variant must also have JD evidence.
 
 PROCESS (MUST FOLLOW)
 1. Read the JD line-by-line.
-2. For each line that contains technical content, extract the explicit technical tokens from that line and create one or more keyword entries as appropriate.
-3. Canonicalize: choose the most descriptive canonical `term` (prefer full names in JD), and put abbreviations / subcomponents in `variants`.
+2. For each non-empty JD line, extract explicit technical tokens that appear verbatim in the line (tools, platforms, services, frameworks, languages, libraries, methodologies, modules, components, networking terms, processes, certifications, acronyms).
+3. For each extracted token:
+   - `term`: use the exact JD phrase (verbatim).
+   - `variants`: include exact JD acronyms/short-forms if they appear verbatim in the JD.
+   - `evidence`: include the exact JD line(s) (verbatim) showing the term.
+   - `category`: assign one concise professional category (e.g., "Platform", "Programming Language", "Tooling", "Database", "Monitoring", "Network", "Methodology").
+   - `rank`: order by importance implied in the JD (frequency/required language).
+4. Do NOT drop or filter out explicit JD terms.
+5. Do NOT invent or expand subcomponents unless they are verbatim in the JD.
 
-SUB-KEYWORD EXTRACTION (MANDATORY)
-- For every JD `evidence` line, also extract all explicit, verbatim technical sub-phrases that appear within that line (e.g., "performance tuning", "networking", "kernel-level configurations").
-- For each canonical `term`:
-  • If the evidence line contains clear sub-topics that are meaningful technical keywords, include them either as:
-      - separate keyword entries (with their own `term`, `category`, `evidence`), OR
-      - as `variants` under the canonical `term`. Choose the option that preserves clarity and avoids duplication.
-  • Always keep the canonical `term` (the main verbatim JD phrase) in the output.
-- Do NOT invent sub-keywords; only extract verbatim substrings of the JD evidence line.
-- If a sub-phrase appears as a standalone technical token elsewhere in the JD, ensure it appears once globally and reference all evidence lines where it occurs.
-- Prefer separate entries when a sub-phrase represents an independent skill/area (e.g., "performance tuning" → separate entry). Prefer `variants` when the sub-phrase is a close alias of the canonical term (e.g., "EC2" under "AWS").
-
-4. Categorize
-   - Each extracted keyword must be assigned one category.
-   - You (the LLM) decide the most appropriate category based only on the JD context.
-   - Categories should be consistent and professional (e.g., "Programming Language", "Cloud Platform", "Database", "Tooling", "Methodology" etc.).
-   - Do not invent vague or abstract categories.
-   - If a keyword could fit multiple categories, choose the one that makes the most sense in a hiring/ATS screening context.
-5. Rank organically by importance (you decide based on JD context). No fixed quotas — rank by significance in the JD.
-6. Also examine the RESUME to help label `weak` vs `missing`, but **do not** use resume evidence to *remove* JD terms from the keyword list — the JD list should reflect the JD fully.
-
-OUTPUT (STRICT JSON ONLY)
-Return **only** a single JSON object (no other text). Schema:
-
+OUTPUT SCHEMA (STRICT JSON)
+Return exactly one JSON object with keys:
 {
   "keywords": [
-    {"rank": int, "term": str, "category": str, "variants": [str], "evidence": [str]}
+    {
+      "rank": int,
+      "term": str, 
+      "category": str,
+      "variants": [str],
+      "evidence": [str]
+    }
   ],
-  "missing": [str],   // (optional — can be empty)
-  "weak": [str],      // (optional)
-  "summary": str      // 2-5 concise sentences describing extraction prioritization
+  "missing": [str],
+  "weak": [str],
+  "summary": str
 }
 
-ADDITIONAL RULES
-- For multi-word phrases, preserve the phrase order exactly as in the JD.
-- For any acronym or short form in JD, include both the short form and the canonical expanded form as `term`/`variants` when available (only if both appear verbatim in JD).
-- If a line contains no technical keywords, skip it (do not invent).
-- Keep JSON valid and parsable; if you include code fences, ensure the JSON block is the only valid JSON.
+DIAGNOSTIC (IF EMPTY)
+- If there are no keywords, return the exact empty object (see above) OR include an extra top-level "skipped_lines" array explaining which JD lines were scanned and why they produced no keywords. (Only use "skipped_lines" for diagnostics; do not invent terms there.)
 
-JSON-ONLY STRICTNESS (MANDATORY)
-- Return **only** one valid JSON object and nothing else. Do NOT include any prose, labels, or code-fence markers (for example: do NOT prefix with "json", "```json", or any other token). The output must begin with "{" and end with "}" only.
-- Ensure the JSON is strictly parseable by `json.loads()`:
-  • Use double quotes for strings.
-  • No trailing commas.
-  • Properly escaped characters (use `\n` for newlines inside strings if needed).
-  • Arrays and objects must be well-formed.
-- If you are unable to produce any keywords, return exactly this empty object and nothing else:
-  {"keywords": [], "missing": [], "weak": [], "summary": ""}
-- If you produce keywords, the top-level JSON must match the schema previously provided. No extra top-level fields allowed.
-- DO NOT include any explanatory text, example blocks, or markdown before or after the JSON. Any deviation will cause the caller to reject the response.
-- Use simple ASCII characters only; do not use smart quotes or non-standard punctuation.
+STRICT RULES (RE-ITERATED)
+- Zero-invention: only JD-verbatim phrases allowed.
+- Preserve phrase ordering and exact wording from JD when possible.
+- Use temperature=0.0 for this call.
+End of instructions.
+"""
 
-MANDATORY RUNTIME SETTINGS SUGGESTION (for callers)
-- Invoke the model with `temperature=0.0` and set `max_tokens` sufficiently high (e.g., 1000–1600) so it can enumerate the full JSON.
-
-MANDATORY DIAGNOSTIC WHEN EMPTY
-- If you would otherwise return an empty "keywords" list (i.e., {"keywords": [], ...}),
-  you MUST still return a populated "skipped_lines" array explaining which JD lines you
-  examined and why they did not yield any verbatim technical tokens. For each skipped
-  line include the exact `line_index`, the `line_text` (verbatim), and a short `reason`
-  such as "no explicit technical tokens", "punctuation-only", "ambiguous wording",
-  or "tokens filtered by strict evidence rule".
-- Example (must be valid JSON):
-  "skipped_lines": [
-    { "line_index": 1, "line_text": "Company overview & mission.", "reason": "no explicit technical tokens" },
-    ...
-  ]
-- Do NOT use this diagnostic to invent keywords. Diagnostics are only for transparency.
-
-End of instructions."""
 
 
 
@@ -227,8 +163,8 @@ You are a senior resume writer and ATS optimization expert.
 GOAL
 - From the provided keywords (target list) and resume context, produce a JSON mapping of grouped Technical Skills that is ready to insert into a resume's 'Technical Skills' section.
 
-OUTPUT (STRICT JSON ONLY)
-Return JSON with this exact schema:
+OUTPUT (STRICT JSON IF POSSIBLE)
+Return JSON with this exact schema when possible:
 
 {
   "skills": {
@@ -238,27 +174,34 @@ Return JSON with this exact schema:
   }
 }
 
+If strict JSON is not feasible, produce a human-readable list of headings followed by colon and comma-separated skills (the caller will attempt to parse).
+
 REQUIREMENTS
-- Group related skills under meaningful headings (e.g., Cloud Computing, Databases, DevOps Tools).
-- Place the highest priority keywords from the provided list into the most relevant headings.
+- Group related skills under clear headings (e.g., Cloud Computing, Databases, DevOps Tools).
+- Use ONLY explicit keywords from the JD + the provided target keywords + any explicit tokens visible in the resume context. Do NOT invent new technologies or synonyms.
 - Do NOT produce 'Core Competencies' as a heading.
-- Do not invent unrelated technologies; use resume + provided keywords only.
-- Return strict JSON only.
+- Prefer including the highest-priority provided keywords in prominent headings.
+- Avoid making the output domain-specific; let the LLM infer grouping from the inputs.
+- Keep output concise and focused on skill tokens (no explanations, samples, or additional metadata).
 """
+
 
 USER_KEYWORD_SENTENCES = """
-JOB DESCRIPTION:
+JD:
 {jd}
 
-RESUME:
+Resume (context):
 {resume}
 
-TARGET_KEYWORDS:
+Provided keywords (one per line):
 {keywords}
 
-TASK:
-Return a JSON object with a 'skills' mapping (heading -> list of skills) following the system schema.
+INSTRUCTION:
+- Using ONLY the explicit tokens above (JD, resume, provided keywords), produce a JSON object with a top-level "skills" map grouping tokens into meaningful headings.
+- If you cannot produce strict JSON, output headings as lines in the form "Heading: item1, item2".
+- Do NOT invent new terms or synonyms. Do NOT include explanations.
 """
+
 
 # === Polish Keyword Sentences (kept for compatibility) ===
 SYSTEM_KEYWORD_SENTENCES_POLISH = """

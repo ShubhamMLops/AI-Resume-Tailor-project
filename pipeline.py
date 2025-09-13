@@ -216,15 +216,6 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     print("======================\n")
 
 
-
-    try:
-        start = raw.find("{"); end = raw.rfind("}") + 1
-        obj = json.loads(raw[start:end])
-    except Exception as e:
-        obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
-        obj["_parse_error"] = str(e)
-        obj["_raw_json"] = raw
-
     # Normalize schema keys
     if not isinstance(obj.get("keywords"), list):
         obj["keywords"] = []
@@ -282,6 +273,7 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
             return True
         return False
 
+    # 2) Post-filter LLM keywords to ensure they actually appear in the JD (strict)
     filtered_keywords = []
     filtered_out = []
 
@@ -312,20 +304,81 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                 "category": kw.get("category", ""),
                 "variants": variants
             }
+            # preserve evidence if LLM provided it
+            if isinstance(kw.get("evidence"), list):
+                safe_kw["evidence"] = kw.get("evidence")
             filtered_keywords.append(safe_kw)
         else:
             filtered_out.append({"term": term, "variants": variants, "reason": "not_in_jd"})
 
-    # Replace keywords with filtered list
     obj["keywords"] = filtered_keywords
-
-    # Reset 'missing' to avoid stale LLM values; use deterministic extract_gaps() for accurate gaps later.
-    obj["missing"] = []
-    obj["weak"] = obj.get("weak", []) if isinstance(obj.get("weak", []), list) else []
     obj["_filtered_out"] = filtered_out
 
-    # Keep compatibility enforcement
+    # 3) FALLBACK: if no keywords after filtering, run a deterministic JD line-by-line extractor
+    if not obj["keywords"]:
+        jd_lines = [ln.rstrip() for ln in (jd_text or "").splitlines() if ln.strip()]
+        fallback_keywords = []
+        seen = set()
+        rank = 1
+
+        # phrase regex: capture sequences of 2..6 tokens (keeps + # . / - in tokens)
+        # improved phrase regex: captures acronyms (1-6 uppercase like AEM), slash tokens (RDS/DynamoDB),
+        # tokens with dots/pluses/hyphens, and multi-word phrases (1..6 tokens)
+        phrase_re = re.compile(
+            r"(?:[A-Z]{1,6}\b"                                 # short uppercase acronyms (AEM, AEMAA) - 1..6 chars
+            r"|[A-Za-z0-9\+#\-/\.]{2,}(?:/[A-Za-z0-9\+#\-/\.]{2,})?"  # token or token/token (RDS/DynamoDB)
+            r"(?:\s+[A-Za-z0-9\+#\-/\.]{2,}){0,5})"
+        )
+
+
+        for line in jd_lines:
+            # For each JD line, extract candidate phrases in order of appearance
+            for m in phrase_re.finditer(line):
+                cand = m.group(0).strip().strip(",:;.-")
+                lower = cand.lower()
+                # skip very short/garbage
+                if len(cand) <= 2:
+                    continue
+                if lower in seen:
+                    continue
+                # keep only if the candidate is clearly technical-like: contains alpha or digits and not a generic filler
+                if re.search(r"[A-Za-z0-9]", cand):
+                    seen.add(lower)
+                    entry = {
+                        "rank": rank,
+                        "term": cand,
+                        "category": "",
+                        "variants": [],
+                        "evidence": [line]
+                    }
+                    fallback_keywords.append(entry)
+                    rank += 1
+                if rank > 50:
+                    break
+            if rank > 50:
+                break
+
+        # if fallback produced items, use them (limit to 25 so downstream UX is stable)
+        if fallback_keywords:
+            obj["keywords"] = fallback_keywords[:25]
+            obj["missing"] = []
+            obj["weak"] = []
+            obj["summary"] = "Fallback deterministic JD line-by-line extraction used because LLM returned no usable keywords."
+            obj["_raw_json"] = raw
+            obj["_filtered_out"] = obj.get("_filtered_out", [])
+            # enforce_jd_keywords later still harmless; return early is acceptable too
+            # continue to final enforcement below
+
+    # Keep compatibility enforcement (original behavior)
     obj = enforce_jd_keywords(obj, jd_text, resume_text)
+
+    # Ensure lists are present
+    if not isinstance(obj.get("keywords"), list):
+        obj["keywords"] = []
+    if not isinstance(obj.get("missing"), list):
+        obj["missing"] = []
+    if not isinstance(obj.get("weak"), list):
+        obj["weak"] = []
 
     return obj
 
@@ -459,6 +512,36 @@ def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
 
     return final
 
+def _first_json_block(text: str) -> Optional[str]:
+    """Return first balanced {...} JSON-like block found in text, else None."""
+    if not text:
+        return None
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for it in items or []:
+        if not isinstance(it, str):
+            continue
+        v = it.strip()
+        if not v:
+            continue
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
 
 # -----------------------------
 # Keyword Sentences -> now returns structured Technical Skills (heading -> list)
@@ -468,86 +551,275 @@ def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: 
                                temperature: float, max_tokens: int, keys: Dict[str, str]) -> str:
     """
     Generate a grouped Technical Skills block for insertion into the resume.
-    This function asks the LLM to return a JSON mapping: { "skills": { "Cloud Computing": ["AWS","EC2"], ... } }
-    Then it converts that JSON into a human-readable block:
 
-    Technical Skills
-    Cloud Computing: AWS, EC2, S3
-    Databases: MySQL, PostgreSQL
-    ...
-
-    We intentionally REMOVE any 'Core Competencies' output and instead structure everything under Technical Skills.
+    Behavior (non-domain-specific):
+    - Preserve resume headings & order; resume content is source-of-truth.
+    - Merge LLM-provided headings/items but do not invent domain-specific headings.
+    - Place new keywords in an existing heading if a simple heading-token overlap exists,
+      otherwise append to fallback "Technical Skills".
+    - Remove duplicates and avoid injecting long prose as skill items.
+    - Return plain text block starting with "Technical Skills" then "Heading: item1, item2" lines.
     """
     provider = _provider_from_keys(provider_pref, keys or {})
 
-    # If no explicit target keywords passed, try to use gaps (caller may compute them), but we accept empty list.
+    # 1) Call LLM (leave this behavior unchanged)
     kws_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
-
-    # Ask the LLM for a JSON mapping of grouped skills
     user_prompt = USER_KEYWORD_SENTENCES.format(jd=(jd_text or ""), resume=(resume_text or ""), keywords=kws_blob)
     raw = provider.chat(model=model_name, system=SYSTEM_KEYWORD_SENTENCES, user=user_prompt, temperature=temperature, max_tokens=max_tokens or 600)
     raw = (raw or "").strip().strip("`").strip()
-    # Try to extract JSON block
-    skills_obj = {}
-    try:
-        start = raw.find('{'); end = raw.rfind('}') + 1
-        if start >= 0 and end > start:
-            skills_obj = json.loads(raw[start:end])
-        else:
-            # If LLM didn't return strict JSON, try to parse line-by-line headings: "Heading: a, b, c"
-            skills_obj = {"skills": {}}
-            for ln in raw.splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                if ":" in ln:
-                    h, vals = ln.split(":", 1)
-                    items = [v.strip() for v in re.split(r",|\u2022", vals) if v.strip()]
-                    skills_obj["skills"][h.strip()] = items
-    except Exception:
-        # fallback: try to parse free text into one heading
+
+    # 2) Try to parse JSON output; otherwise parse heuristically
+    skills_obj = {"skills": {}}
+    def _try_parse_json(s: str):
         try:
-            # take everything as a single Technical Skills line
-            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-            if lines:
-                skills_obj = {"skills": {"Technical Skills": []}}
-                for ln in lines:
-                    if ":" in ln:
-                        h, vals = ln.split(":", 1)
-                        items = [v.strip() for v in re.split(r",|\u2022", vals) if v.strip()]
-                        skills_obj["skills"][h.strip()] = items
-                    else:
-                        # add individual tokens
-                        tokens = [t.strip() for t in re.split(r",|\u2022|\s{2,}", ln) if t.strip()]
-                        skills_obj["skills"]["Technical Skills"].extend(tokens)
+            start = s.find("{"); end = s.rfind("}") + 1
+            if start >= 0 and end > start:
+                obj = json.loads(s[start:end])
+                if isinstance(obj, dict) and "skills" in obj and isinstance(obj["skills"], dict):
+                    return obj
         except Exception:
-            skills_obj = {"skills": {}}
+            pass
+        return None
 
-    # Normalize the skills object and build text block
-    skills = skills_obj.get("skills") or {}
-    # If empty, fallback to target_keywords grouped under "Technical Skills"
-    if not skills:
-        if target_keywords:
-            skills = {"Technical Skills": list(dict.fromkeys(target_keywords))}
-        else:
-            skills = {}
+    parsed = _try_parse_json(raw)
+    if parsed:
+        skills_obj = {"skills": {}}
+        for h, arr in (parsed.get("skills") or {}).items():
+            items = []
+            if isinstance(arr, list):
+                for v in arr:
+                    if isinstance(v, str) and v.strip():
+                        items.append(v.strip())
+                    else:
+                        items.append(str(v).strip())
+            elif isinstance(arr, str):
+                items = [p.strip() for p in re.split(r",|\u2022", arr) if p.strip()]
+            else:
+                items = [str(arr).strip()]
+            if items:
+                skills_obj["skills"][h.strip()] = items
+    else:
+        # fallback: parse "Heading: a, b" lines or bullets
+        skills_obj = {"skills": {}}
+        for ln in raw.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ":" in ln:
+                left, right = ln.split(":", 1)
+                heading = left.strip()
+                items = [p.strip() for p in re.split(r",|\u2022", right) if p.strip()]
+                if items:
+                    skills_obj["skills"].setdefault(heading, []).extend(items)
+            else:
+                toks = [t.strip() for t in re.split(r",|\u2022|\t", ln) if t.strip()]
+                if toks:
+                    skills_obj["skills"].setdefault("Technical Skills", []).extend(toks)
 
-    # Build a readable block
-    out_lines = []
-    out_lines.append("Technical Skills")
-    for heading, items in skills.items():
-        # skip any accidental 'Core Competencies' headings (we must remove core competencies)
-        if heading.strip().lower().startswith("core"):
+    # Helpers: detect short, skill-like fragments and extract tokens from resume lines
+    def _is_short_skill(s: str) -> bool:
+        if not s or not s.strip():
+            return False
+        s = s.strip()
+        # drop markers only
+        if re.fullmatch(r"[-•▪‣·\s]+", s):
+            return False
+        words = s.split()
+        # drop long prose (> 8 words)
+        if len(words) > 8:
+            return False
+        # drop obvious role/prose lines
+        if re.search(r"\b(role|responsib|project|experience|since|from|to|with|present|manager|engineer|joined|company)\b", s, flags=re.I):
+            return False
+        return True
+
+    def _extract_skill_tokens_from_line(line: str) -> List[str]:
+        if not line or not line.strip():
+            return []
+        s = line.strip()
+        s = re.sub(r"^[-•▪‣·*]\s*", "", s).strip()
+        if "," in s:
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            return [p for p in parts if _is_short_skill(p)]
+        if _is_short_skill(s):
+            return [s]
+        return []
+
+    # 3) Parse resume to find existing skill headings and items (preserve order)
+    def _find_resume_skill_sections(text: str):
+        lines = (text or "").splitlines()
+        sections = []
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s:
+                continue
+            if re.match(r"(?i)^(technical\s*skills|skills|core\s*competencies|core\s*skills|expertise|toolbox|technical\s*expertise)\s*[:\-–—]?\s*$", s):
+                start = i + 1
+                end = len(lines)
+                for j in range(start, len(lines)):
+                    nxt = lines[j].strip()
+                    if not nxt:
+                        end = j
+                        break
+                    if re.match(r"(?i)^(work\s*experience|experience|education|projects|certifications|awards|publications|professional\s*summary|profile\s*summary)\s*[:\-–—]?\s*$", nxt):
+                        end = j
+                        break
+                block = [lines[k].rstrip() for k in range(start, end) if lines[k].strip()]
+                sections.append((s.rstrip(":"), block))
+        return sections
+
+    resume_sections = _find_resume_skill_sections(resume_text)
+
+    merged_headings = []
+    merged_skills = {}
+
+    for heading, block_lines in resume_sections:
+        items = []
+        for ln in block_lines:
+            toks = _extract_skill_tokens_from_line(ln)
+            for t in toks:
+                if t and t.strip():
+                    items.append(t.strip())
+        seen_local = set(); final_items = []
+        for it in items:
+            kl = it.lower()
+            if kl in seen_local:
+                continue
+            seen_local.add(kl); final_items.append(it)
+        if final_items:
+            merged_headings.append(heading)
+            merged_skills[heading] = final_items
+
+    # 4) Merge LLM-provided headings/items without domain inference
+    for h, arr in (skills_obj.get("skills") or {}).items():
+        if not arr:
             continue
-        # normalize items
-        items_arr = []
-        for it in items or []:
-            if isinstance(it, str) and it.strip():
-                items_arr.append(it.strip())
-        if items_arr:
-            out_lines.append(f"{heading}: {', '.join(items_arr)}")
+        items_short = [i.strip() for i in arr if isinstance(i, str) and _is_short_skill(i.strip())]
+        if not items_short:
+            continue
+        if h in merged_skills:
+            exist = {x.lower() for x in merged_skills[h]}
+            for it in items_short:
+                if it.lower() not in exist:
+                    merged_skills[h].append(it); exist.add(it.lower())
+        else:
+            # avoid adding headings that obviously look like prose sections
+            if re.match(r"(?i)^(work\s*experience|experience|education|projects|requirements|role|responsibilit)s?", h):
+                continue
+            merged_headings.append(h)
+            merged_skills[h] = []
+            seen_h = set()
+            for it in items_short:
+                if it.lower() not in seen_h:
+                    merged_skills[h].append(it); seen_h.add(it.lower())
 
-    return "\n".join(out_lines).strip()
+    # 5) Build a simple JD heading map (short fragments only) - used only to help placement, not to infer domains
+    jd_lines = [ln.strip() for ln in (jd_text or "").splitlines() if ln.strip()]
+    jd_heading_map = {}
+    for i, ln in enumerate(jd_lines):
+        s = ln.strip()
+        if re.match(r"^[A-Za-z0-9 \-]{1,80}\s*:$", s):
+            h = s.rstrip(":").strip()
+            start = i + 1
+            end = len(jd_lines)
+            for j in range(start, len(jd_lines)):
+                nxt = jd_lines[j].strip()
+                if not nxt or re.match(r"^[A-Za-z0-9 \-]{1,80}\s*:$", nxt):
+                    end = j
+                    break
+            block = [ln2.strip() for ln2 in jd_lines[start:end] if ln2.strip()]
+            tokens = []
+            for bl in block:
+                parts = [p.strip() for p in re.split(r",|\u2022", bl) if p.strip()]
+                for p in parts:
+                    if _is_short_skill(p):
+                        tokens.append(p)
+            if tokens:
+                jd_heading_map[h] = tokens
+
+    # 6) Insert target_keywords preserving resume order; append to matching heading or fallback
+    fallback = "Technical Skills"
+    global_seen = set()
+    for h in merged_headings:
+        for it in merged_skills.get(h, []):
+            global_seen.add(it.lower())
+
+    # process each target keyword in order
+    for kw in (target_keywords or []):
+        if not kw or not kw.strip():
+            continue
+        kws = kw.strip()
+        kl = kws.lower()
+        if kl in global_seen:
+            continue
+        placed = False
+        # 6a) place under an existing resume heading if simple token overlap
+        for heading in merged_headings:
+            h_low = heading.lower()
+            h_tokens = re.findall(r"[A-Za-z0-9]+", h_low)
+            k_tokens = re.findall(r"[A-Za-z0-9]+", kl)
+            if any(ht in kt or kt in ht for ht in h_tokens for kt in k_tokens):
+                merged_skills.setdefault(heading, []).append(kws)
+                global_seen.add(kl)
+                placed = True
+                break
+        if placed:
+            continue
+        # 6b) place under JD heading if exact short fragment match
+        for jh, tokens in jd_heading_map.items():
+            if any(kws.lower() == t.lower() for t in tokens):
+                if jh in merged_skills:
+                    merged_skills[jh].append(kws)
+                else:
+                    merged_headings.append(jh)
+                    merged_skills[jh] = [kws]
+                global_seen.add(kl)
+                placed = True
+                break
+        if placed:
+            continue
+        # 6c) fallback - append to Technical Skills at the end (ensure fallback exists last)
+        if fallback not in merged_skills:
+            merged_headings.append(fallback)
+            merged_skills[fallback] = []
+        merged_skills[fallback].append(kws)
+        global_seen.add(kl)
+
+    # 7) Final cleanup: dedupe each heading preserving order and remove non-short items
+    out_lines = []
+    for heading in merged_headings:
+        items = merged_skills.get(heading, []) or []
+        cleaned = []
+        seen_local = set()
+        for it in items:
+            if not isinstance(it, str):
+                it = str(it)
+            it_s = it.strip()
+            if not it_s:
+                continue
+            if not _is_short_skill(it_s):
+                # allow if exact match present in JD heading tokens (rare)
+                if not any(it_s.lower() == t.lower() for vs in jd_heading_map.values() for t in vs):
+                    continue
+            key = it_s.lower()
+            if key in seen_local:
+                continue
+            seen_local.add(key)
+            cleaned.append(it_s)
+        if cleaned:
+            out_lines.append(f"{heading}: {', '.join(cleaned)}")
+
+    if not out_lines:
+        # fallback output if nothing found
+        filtered_targets = [k.strip() for k in (target_keywords or []) if _is_short_skill(k)]
+        if filtered_targets:
+            out_lines = [f"Technical Skills: {', '.join(filtered_targets)}"]
+        else:
+            out_lines = ["Technical Skills:"]
+
+    # Prepend the UI title line "Technical Skills" as before
+    return "\n".join(["Technical Skills"] + out_lines).strip()
+
 
 def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
                              provider_pref: Optional[str], model_name: Optional[str],
@@ -587,66 +859,6 @@ def _remove_core_competencies_section(text: str) -> str:
     block_end = end + (nxt.start() if nxt else len(after))
     return (text[:start] + text[block_end:]).strip()
 
-def insert_technical_skills(full_text: str, skills_block: str) -> str:
-    """
-    Ensure Core Competencies is removed and Technical Skills section is inserted or replaced.
-    skills_block is a plain text block starting with "Technical Skills" followed by lines "Heading: item, item"
-    """
-    if not full_text:
-        return full_text
-    text = full_text
-
-    # 1) Remove Core Competencies entirely
-    text = _remove_core_competencies_section(text)
-
-    # 2) Normalize skills_block
-    lines = [ln.rstrip() for ln in (skills_block or "").splitlines() if ln.strip()]
-    if not lines:
-        # nothing to insert; simply remove core competencies and return
-        return text
-
-    # If the skills_block already starts with "Technical Skills", keep as-is, else try to wrap
-    if lines[0].strip().lower().startswith("technical"):
-        block = "\n".join(lines).strip()
-    else:
-        # wrap the whole block under Technical Skills heading
-        block = "Technical Skills\n" + "\n".join(lines).strip()
-
-    # 3) Replace existing Technical Skills if present
-    pattern = re.compile(r"(?im)^\s*technical\s*skills\s*[:\-–—]?\s*$")
-    m = pattern.search(text or "")
-    if m:
-        start = m.start()
-        end = m.end()
-        after = text[end:]
-        nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications|profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$", after)
-        section_end = end + (nxt.start() if nxt else len(after))
-        head = text[:end].rstrip()
-        tail = text[section_end:].lstrip("\n")
-        new_text = (head + "\n" + block + "\n\n" + tail).strip()
-        return new_text
-    else:
-        # If no Technical Skills heading, try to insert after Summary or after Contact block (first non-empty line)
-        # Insert after Summary if exists
-        summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
-        m2 = summary_heading_re.search(text)
-        if m2:
-            # find end of summary section
-            head_end = m2.end()
-            after = text[head_end:]
-            nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
-            insert_pos = head_end + (nxt.start() if nxt else len(after))
-            new_text = text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip()
-            return new_text
-        else:
-            # fallback: insert near the top after first non-empty line
-            parts = text.splitlines()
-            idx = 0
-            while idx < len(parts) and not parts[idx].strip():
-                idx += 1
-            insert_at = min(len(parts), idx + 1)
-            new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
-            return "\n".join(new_lines).strip()
 
 # -----------------------------
 # Keyword Sentences Polishing (left as-is)
@@ -800,52 +1012,202 @@ def _remove_core_competencies_section(text: str) -> str:
     return (text[:start] + text[block_end:]).strip()
 
 
-def insert_technical_skills_after_summary(full_text: str, skills_block: str) -> str:
+def _parse_block_to_headings(block: str) -> Dict[str, List[str]]:
     """
-    Ensure exactly one Technical Skills block: remove Core Competencies and any existing
-    Technical Skills sections, then insert the supplied skills_block immediately after
-    the Profile Summary (or after name/contacts if no summary).
+    Parse a skills_block (lines like "Heading: a, b" or raw 'Technical Skills' block)
+    into { heading: [item, ...] } preserving item text.
+    """
+    out = {}
+    if not block:
+        return out
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    # if first line is "Technical Skills", drop it for parsing headings
+    if lines and lines[0].lower().startswith("technical"):
+        lines = lines[1:]
+    for ln in lines:
+        if ":" in ln:
+            left, right = ln.split(":", 1)
+            heading = left.strip()
+            items = [p.strip() for p in re.split(r",|\u2022", right) if p.strip()]
+            if items:
+                out.setdefault(heading, []).extend(items)
+        else:
+            # treat as inline items under fallback heading
+            items = [p.strip() for p in re.split(r",|\u2022|\t", ln) if p.strip()]
+            if items:
+                out.setdefault("Technical Skills", []).extend(items)
+    # normalize lists: strip whitespace, remove empty
+    for h in list(out.keys()):
+        out[h] = [i for i in (x.strip() for x in out[h]) if i]
+        if not out[h]:
+            del out[h]
+    return out
+
+def _merge_preserve_resume(resume_text: str, parsed_new: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """
+    Read existing resume Technical Skills sections, preserve them exactly,
+    and merge new parsed_new headings/items by:
+    - if heading exists in resume, append only items not already present (case-insensitive)
+    - if heading missing, add it at the end in the order parsed_new provides
+    - ensure no duplicates (case-insensitive), do not change order of existing items
+    Returns merged heading->items map and insertion order (list of headings).
+    """
+    # reuse resume parsing logic (small inline helper similar to _find_resume_skill_sections)
+    def _find_resume_skill_sections_local(text: str):
+        lines = (text or "").splitlines()
+        sections = []
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s:
+                continue
+            if re.match(r"(?i)^(technical\s*skills|skills|core\s*competencies|core\s*skills|expertise|toolbox|technical\s*expertise)\s*[:\-–—]?\s*$", s):
+                start = i + 1
+                end = len(lines)
+                for j in range(start, len(lines)):
+                    nxt = lines[j].strip()
+                    if not nxt:
+                        end = j
+                        break
+                    if re.match(r"(?i)^(work\s*experience|experience|education|projects|certifications|awards|publications|professional\s*summary|profile\s*summary)\s*[:\-–—]?\s*$", nxt):
+                        end = j
+                        break
+                block = [lines[k].rstrip() for k in range(start, end) if lines[k].strip()]
+                sections.append((s.rstrip(":"), block))
+        return sections
+
+    resume_sections = _find_resume_skill_sections_local(resume_text)
+    merged_headings = []
+    merged_skills = {}
+
+    # preserve resume headings and items exactly (order)
+    for heading, block_lines in resume_sections:
+        items = []
+        for ln in block_lines:
+            ln = ln.strip()
+            # a line may be "Heading: a, b" or a bullet; attempt parsing
+            if ":" in ln:
+                _, vals = ln.split(":", 1)
+                parts = [p.strip() for p in re.split(r",|\u2022", vals) if p.strip()]
+                items.extend(parts)
+            else:
+                # bullet or comma separated
+                parts = [p.strip() for p in re.split(r",|\u2022|\t", ln) if p.strip()]
+                items.extend(parts)
+        # dedupe preserving order (case-insensitive)
+        seen = set(); final_items = []
+        for it in items:
+            key = it.lower()
+            if key in seen:
+                continue
+            seen.add(key); final_items.append(it)
+        if final_items:
+            merged_headings.append(heading)
+            merged_skills[heading] = final_items
+
+    # now merge parsed_new: append new items into existing headings (without modifying existing order)
+    for new_h in parsed_new:
+        new_items = parsed_new.get(new_h, []) or []
+        if not new_items:
+            continue
+        if new_h in merged_skills:
+            exist_keys = {x.lower() for x in merged_skills[new_h]}
+            for it in new_items:
+                if it and it.strip() and it.lower() not in exist_keys:
+                    merged_skills[new_h].append(it.strip()); exist_keys.add(it.lower())
+        else:
+            # add heading at the end in the order parsed_new provides
+            merged_headings.append(new_h)
+            # dedupe new items preserving their order
+            seen_n = set(); final_n = []
+            for it in new_items:
+                k = it.lower()
+                if k not in seen_n:
+                    seen_n.add(k); final_n.append(it)
+            merged_skills[new_h] = final_n
+
+    return {"headings": merged_headings, "skills": merged_skills}
+
+def _render_skills_block(merged: Dict[str, Any]) -> str:
+    """
+    Produce a skills_block (lines like "Heading: a, b") from merged structure.
+    """
+    out_lines = []
+    for h in merged.get("headings", []):
+        items = merged.get("skills", {}).get(h, []) or []
+        if not items:
+            continue
+        out_lines.append(f"{h}: {', '.join(items)}")
+    if not out_lines:
+        return "Technical Skills"
+    return "Technical Skills\n" + "\n".join(out_lines)
+
+def insert_technical_skills(full_text: str, skills_block: str) -> str:
+    """
+    Replace or insert Technical Skills while preserving existing technical skills exactly.
+    - Remove Core Competencies (kept behavior)
+    - If existing Technical Skills present, replace its body with merged block that preserves
+      original items and appends new ones (no reordering of original items).
+    - If no Technical Skills heading, insert near Summary or top preserving resume structure.
     """
     if not full_text:
         return full_text
-
     text = full_text
 
-    # Remove Core Competencies and existing Technical Skills to avoid duplicates
+    # remove core competencies only (preserve existing skills)
     text = _remove_core_competencies_section(text)
-    text = _remove_technical_skills_section(text)
 
-    # Normalize skills_block into lines and skip if empty
-    lines = [ln.rstrip() for ln in (skills_block or "").splitlines() if ln.strip()]
-    if not lines:
+    # parse incoming skills block into headings->items
+    parsed_new = _parse_block_to_headings(skills_block or "")
+
+    # if incoming block is empty, just return text (no destructive change)
+    if not parsed_new:
         return text
 
-    # If the user supplied a heading "Technical Skills" already, keep as-is; else add heading
-    if lines[0].strip().lower().startswith("technical"):
-        block = "\n".join(lines).strip()
-    else:
-        block = "Technical Skills\n" + "\n".join(lines).strip()
+    # merge with resume existing skill headings preserving original items & order
+    merged = _merge_preserve_resume(text, parsed_new)
+    block = _render_skills_block(merged)
 
-    # Find the Profile Summary heading location
-    summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
-    m = summary_heading_re.search(text)
+    # replace existing Technical Skills if present
+    pattern = re.compile(r"(?im)^\s*technical\s*skills\s*[:\-–—]?\s*$")
+    m = pattern.search(text or "")
     if m:
-        # Insert after the existing summary block (end of its body)
-        head_end = m.end()
-        after = text[head_end:]
-        nxt = re.search(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
-        insert_pos = head_end + (nxt.start() if nxt else len(after))
-        new_text = text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip()
+        start = m.start()
+        end = m.end()
+        after = text[end:]
+        nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications|profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$", after)
+        section_end = end + (nxt.start() if nxt else len(after))
+        head = text[:end].rstrip()
+        tail = text[section_end:].lstrip("\n")
+        new_text = (head + "\n" + block + "\n\n" + tail).strip()
         return new_text
+    else:
+        # If no Technical Skills heading, try to insert after Summary or after Contact block (first non-empty line)
+        summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
+        m2 = summary_heading_re.search(text)
+        if m2:
+            head_end = m2.end()
+            after = text[head_end:]
+            nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
+            insert_pos = head_end + (nxt.start() if nxt else len(after))
+            new_text = text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip()
+            return new_text
+        else:
+            # fallback: insert near the top after first non-empty line
+            parts = text.splitlines()
+            idx = 0
+            while idx < len(parts) and not parts[idx].strip():
+                idx += 1
+            insert_at = min(len(parts), idx + 1)
+            new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
+            return "\n".join(new_lines).strip()
 
-    # If no Profile Summary heading, insert after first non-empty line (name/contacts)
-    parts = text.splitlines()
-    idx = 0
-    while idx < len(parts) and not parts[idx].strip():
-        idx += 1
-    insert_at = min(len(parts), idx + 1)
-    new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
-    return "\n".join(new_lines).strip()
+def insert_technical_skills_after_summary(full_text: str, skills_block: str) -> str:
+    """
+    Backwards-compatible wrapper: ensure the block is placed after the summary section
+    while preserving existing skills as per insert_technical_skills.
+    """
+    # simply delegate to insert_technical_skills (it already places after summary when needed)
+    return insert_technical_skills(full_text, skills_block)
 
 # -----------------------------
 # Tailor (JSON-first, fallback)
