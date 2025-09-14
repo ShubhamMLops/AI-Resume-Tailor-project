@@ -121,6 +121,55 @@ def _provider_from_keys(provider_preference: Optional[str], keys: Dict[str, str]
         raise RuntimeError("No API key provided in the app. Enter a key in the sidebar.")
     return provider
 
+def jd_to_json_via_llm(jd_text: str, provider, model_name: Optional[str],
+                       temperature: float = 0.0, max_tokens: int = 800) -> Dict[str, Any]:
+    """
+    Ask the LLM to read the JD line-by-line, normalize/trim whitespace and return a strict JSON object:
+    {
+      "lines": [ {"index": 0, "text": "<verbatim JD line trimmed>"}, ... ],
+      "flat": "<concat of trimmed lines with single space separators>"
+    }
+    The LLM must return JSON only. If the LLM fails to return valid JSON, this function falls back to a
+    deterministic local normalization.
+    """
+    if not jd_text or not jd_text.strip():
+        return {"lines": [], "flat": ""}
+
+    system_prompt = (
+        "You are a strict JSON-only transformer. Read the JOB DESCRIPTION verbatim, line-by-line. "
+        "For each non-empty line produce a JSON array entry with {\"index\": <line_index>, \"text\": \"<trimmed_line>\"}. "
+        "Trim leading/trailing whitespace and collapse internal repeated spaces to a single space in each line. "
+        "Do NOT change wording, do NOT invent or remove words. Return a single JSON object only with keys: "
+        "\"lines\" (array of objects as described) and \"flat\" (string: all trimmed lines joined by single spaces). "
+        "If no valid lines, return {\"lines\": [], \"flat\": \"\"}."
+    )
+
+    user_prompt = f"JOB DESCRIPTION (verbatim):\n{jd_text}\n\nReturn only the JSON object as specified."
+
+    try:
+        raw = provider.chat(model=model_name, system=system_prompt, user=user_prompt, temperature=temperature, max_tokens=max_tokens or 800)
+        raw = (raw or "").strip().strip("`").strip()
+        # extract first {...} block
+        start = raw.find("{"); end = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            block = raw[start:end]
+            obj = json.loads(block)
+            # basic sanity check
+            if isinstance(obj, dict) and "lines" in obj and "flat" in obj:
+                return obj
+    except Exception:
+        pass
+
+    # Fallback deterministic normalization if LLM fails or returned invalid JSON
+    lines = []
+    for i, ln in enumerate([l for l in (jd_text or "").splitlines()]):
+        s = ln.strip()
+        s = re.sub(r"\s+", " ", s)
+        if s:
+            lines.append({"index": i, "text": s})
+    flat = " ".join([l["text"] for l in lines])
+    return {"lines": lines, "flat": flat}
+
 # -----------------------------
 # Analysis
 # -----------------------------
@@ -150,6 +199,67 @@ def analyze(resume_text: str, jd_text: str) -> Dict[str, Any]:
         "contacts": extract_contacts_regex(resume_text),
     }
 
+
+def extract_core_competencies_from_jd(jd_text: str) -> List[str]:
+    """
+    Deterministic extraction of 'Core Competencies' from a JD.
+    - If JD contains an explicit heading like 'Core Competencies' (case-insensitive),
+      collect the non-empty lines under that heading until a blank line or next heading.
+    - Otherwise, look for short comma-separated lists or single-line lists containing many short tokens
+      near the top of the JD that are likely competency lists (heuristic).
+    - Always return items verbatim as found in the JD (no invention), deduped preserving order.
+    """
+    if not jd_text:
+        return []
+
+    lines = [ln.rstrip() for ln in jd_text.splitlines()]
+    n = len(lines)
+    out = []
+    seen = set()
+
+    # 1) Find explicit "Core Competencies"/"Core Skills" heading
+    heading_re = re.compile(r"(?i)^\s*(core\s*competenc(?:ies|y)|core\s*skills|core\s*expertise)\s*[:\-–—]?\s*$")
+    section_heading_re = re.compile(r"^[A-Za-z0-9 \-]{1,80}\s*:$")  # generic heading
+    for i, ln in enumerate(lines):
+        if heading_re.match(ln.strip()):
+            # collect subsequent non-empty lines until blank or next section heading
+            for j in range(i+1, n):
+                nxt = lines[j].strip()
+                if not nxt:
+                    break
+                if section_heading_re.match(nxt):
+                    break
+                # split lists like "A, B, C" into items else take line as-is
+                parts = [p.strip() for p in re.split(r",|\u2022|;|\t", nxt) if p.strip()]
+                if parts:
+                    for p in parts:
+                        key = p.lower()
+                        if key not in seen:
+                            seen.add(key); out.append(p)
+                else:
+                    key = nxt.lower()
+                    if key not in seen:
+                        seen.add(key); out.append(nxt)
+            if out:
+                return out
+
+    # 2) Heuristic: locate lines with many short tokens (comma separated) near top
+    # e.g. "AWS, Terraform, Docker, Kubernetes"
+    for ln in lines[:20]:  # only look at first 20 lines to avoid scanning entire JD
+        if not ln.strip():
+            continue
+        parts = [p.strip() for p in re.split(r",|\u2022|;|\band\b|\bor\b", ln) if p.strip()]
+        if len(parts) >= 3:  # likely a competency list
+            for p in parts:
+                key = p.lower()
+                if key not in seen:
+                    seen.add(key); out.append(p)
+            if out:
+                return out
+
+    # 3) Nothing found
+    return []
+
 # -----------------------------
 # Keywords (LLM)
 # -----------------------------
@@ -168,6 +278,15 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     - Returns obj with 'keywords' filtered and '_filtered_out' listing removed entries.
     """
     provider = _provider_from_keys(provider_pref, keys)
+    # Convert raw JD to normalized JSON via LLM (for more stable downstream extraction).
+    _jd_json = jd_to_json_via_llm(jd_text, provider, model_name, temperature=0.0, max_tokens=800)
+    # Print the JD JSON to terminal (not GUI)
+    print("\n=== NORMALIZED JD JSON (used for extraction) ===")
+    print(json.dumps(_jd_json, indent=2, ensure_ascii=False))
+    print("==============================================\n")
+    # Replace jd_text with the normalized flat representation for downstream use
+    jd_text = _jd_json.get("flat", jd_text)
+
 
     # If JD is empty, return a clean empty structure immediately
     if not (jd_text and jd_text.strip()):
@@ -321,53 +440,130 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         seen = set()
         rank = 1
 
-        # phrase regex: capture sequences of 2..6 tokens (keeps + # . / - in tokens)
-        # improved phrase regex: captures acronyms (1-6 uppercase like AEM), slash tokens (RDS/DynamoDB),
-        # tokens with dots/pluses/hyphens, and multi-word phrases (1..6 tokens)
-        phrase_re = re.compile(
-            r"(?:[A-Z]{1,6}\b"                                 # short uppercase acronyms (AEM, AEMAA) - 1..6 chars
-            r"|[A-Za-z0-9\+#\-/\.]{2,}(?:/[A-Za-z0-9\+#\-/\.]{2,})?"  # token or token/token (RDS/DynamoDB)
-            r"(?:\s+[A-Za-z0-9\+#\-/\.]{2,}){0,5})"
-        )
+        # Helper: tech-like candidate checks and normalization
+        token_re_local = re.compile(r"[A-Za-z0-9\+#\-/\.]+")
+        stop_verbs = re.compile(r"\b(design|implement|maintain|develop|manage|ensure|work|automate|analyze|write|partner|integrate|provide|perform|configure)\b", re.I)
+        noise_words = {"responsibilities", "requirements", "experience", "responsibilit", "development", "management"}
 
+        def is_tech_candidate(s: str) -> bool:
+            s = s.strip().strip(",:;.-()[]")
+            if not s or len(s) <= 1:
+                return False
+            # reject obviously long prose (>7 words)
+            if len(s.split()) > 7:
+                return False
+            # reject pure verbs/prose lines
+            if stop_verbs.search(s):
+                # allow if the string contains clear tech tokens like '/' (RDS/DynamoDB) or dots or '+' or capitalized acronym
+                if not re.search(r"[/#\.+]|[A-Z]{2,}", s):
+                    return False
+            # must contain at least one alpha/numeric token of length >=2
+            toks = token_re_local.findall(s)
+            if not toks:
+                return False
+            if all(len(t) <= 1 for t in toks):
+                return False
+            # filter out generic headings/noise
+            low = s.lower()
+            if any(w in low for w in noise_words):
+                return False
+            return True
+
+        # Preferred extraction strategy:
+        # 1) split on common separators (commas, 'such as', 'e.g.', 'or', ';')
+        # 2) also capture slash tokens (RDS/DynamoDB), parentheses content, and short phrases (<=4 tokens)
+        sep_re = re.compile(r",|\band\b|\bor\b|\bsuch as\b|\be\.g\.\b|;|\u2022", re.I)
+        slash_or_paren_re = re.compile(r"[A-Za-z0-9\+#\-/\.]{2,}(?:/[A-Za-z0-9\+#\-/\.]{2,})?")
 
         for line in jd_lines:
-            # For each JD line, extract candidate phrases in order of appearance
-            for m in phrase_re.finditer(line):
-                cand = m.group(0).strip().strip(",:;.-")
-                lower = cand.lower()
-                # skip very short/garbage
-                if len(cand) <= 2:
-                    continue
-                if lower in seen:
-                    continue
-                # keep only if the candidate is clearly technical-like: contains alpha or digits and not a generic filler
-                if re.search(r"[A-Za-z0-9]", cand):
-                    seen.add(lower)
-                    entry = {
-                        "rank": rank,
-                        "term": cand,
-                        "category": "",
-                        "variants": [],
-                        "evidence": [line]
-                    }
-                    fallback_keywords.append(entry)
+            # 1. extract parenthetical content first (e.g., "(Jenkins, Bitbucket, Git)")
+            for par in re.findall(r"\(([^)]+)\)", line):
+                for part in sep_re.split(par):
+                    cand = part.strip()
+                    if not cand:
+                        continue
+                    if not is_tech_candidate(cand):
+                        continue
+                    key = cand.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fallback_keywords.append({"rank": rank, "term": cand, "category": "", "variants": [], "evidence": [line]})
                     rank += 1
+                    if rank > 50:
+                        break
                 if rank > 50:
                     break
             if rank > 50:
                 break
 
-        # if fallback produced items, use them (limit to 25 so downstream UX is stable)
-        if fallback_keywords:
-            obj["keywords"] = fallback_keywords[:25]
+            # 2. split line on separators to get short candidate fragments
+            parts = [p.strip() for p in sep_re.split(line) if p.strip()]
+            for part in parts:
+                # further split long fragments by "such as" or "e.g." already handled; check slash tokens
+                # capture explicit slash tokens
+                for m in slash_or_paren_re.finditer(part):
+                    cand = m.group(0).strip().strip(",:;.-")
+                    if not cand or len(cand) <= 1:
+                        continue
+                    if not is_tech_candidate(cand):
+                        continue
+                    key = cand.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fallback_keywords.append({"rank": rank, "term": cand, "category": "", "variants": [], "evidence": [line]})
+                    rank += 1
+                    if rank > 50:
+                        break
+                if rank > 50:
+                    break
+
+                # If no slash-like tokens, consider short phrase fragments (<=4 tokens)
+                words = [w for w in token_re_local.findall(part)]
+                if 0 < len(words) <= 4:
+                    cand = " ".join(words)
+                    if not cand:
+                        continue
+                    if not is_tech_candidate(cand):
+                        continue
+                    key = cand.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fallback_keywords.append({"rank": rank, "term": cand, "category": "", "variants": [], "evidence": [line]})
+                    rank += 1
+                    if rank > 50:
+                        break
+            if rank > 50:
+                break
+
+        # Final cleanup: prefer shorter, clearly-technical tokens and limit results
+        cleaned = []
+        seen_c = set()
+        for ent in fallback_keywords:
+            t = ent["term"].strip()
+            # prefer tokens with letters/digits and reasonable length
+            if len(t) < 2 or len(t) > 70:
+                continue
+            # avoid pure stop-verb fragments
+            if stop_verbs.fullmatch(t):
+                continue
+            k = t.lower()
+            if k in seen_c:
+                continue
+            seen_c.add(k)
+            cleaned.append({"rank": len(cleaned) + 1, "term": t, "category": "", "variants": [], "evidence": ent.get("evidence", [])})
+            if len(cleaned) >= 25:
+                break
+
+        if cleaned:
+            obj["keywords"] = cleaned
             obj["missing"] = []
             obj["weak"] = []
-            obj["summary"] = "Fallback deterministic JD line-by-line extraction used because LLM returned no usable keywords."
+            obj["summary"] = "Fallback deterministic JD line-by-line extraction used to derive explicit JD tokens."
             obj["_raw_json"] = raw
             obj["_filtered_out"] = obj.get("_filtered_out", [])
-            # enforce_jd_keywords later still harmless; return early is acceptable too
-            # continue to final enforcement below
 
     # Keep compatibility enforcement (original behavior)
     obj = enforce_jd_keywords(obj, jd_text, resume_text)
@@ -542,6 +738,7 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
             seen.add(v)
             out.append(v)
     return out
+
 
 # -----------------------------
 # Keyword Sentences -> now returns structured Technical Skills (heading -> list)
@@ -1201,13 +1398,141 @@ def insert_technical_skills(full_text: str, skills_block: str) -> str:
             new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
             return "\n".join(new_lines).strip()
 
-def insert_technical_skills_after_summary(full_text: str, skills_block: str) -> str:
+def insert_technical_skills_after_summary(full_text: str, skills_block: str,
+                                         jd_core_competencies: Optional[List[str]] = None) -> str:
     """
-    Backwards-compatible wrapper: ensure the block is placed after the summary section
-    while preserving existing skills as per insert_technical_skills.
+    Ensure exactly one Technical Skills block: remove Core Competencies and any existing
+    Technical Skills sections, then insert the supplied skills_block immediately after
+    the Profile Summary (or after name/contacts if no summary).
+
+    Behavior tweak:
+    - If jd_core_competencies is provided and non-empty:
+        * Preserve any existing resume Core Competencies and MERGE JD core competencies
+          (JD items are inserted above Technical Skills under a 'Core Competencies' heading).
+    - If jd_core_competencies is None or empty:
+        * Remove any existing Core Competencies sections from the resume (do not preserve).
     """
-    # simply delegate to insert_technical_skills (it already places after summary when needed)
-    return insert_technical_skills(full_text, skills_block)
+    if not full_text:
+        return full_text
+
+    text = full_text
+
+    # If JD did NOT provide core competencies, remove existing Core Competencies
+    if not jd_core_competencies:
+        text = _remove_core_competencies_section(text)
+    # If JD provided core competencies, preserve existing resume Core Competencies (don't remove),
+    # but we'll later ensure merging/insertion happens.
+
+    # Always remove existing Technical Skills to avoid duplicates (we will re-insert)
+    text = _remove_technical_skills_section(text)
+
+    # Normalize skills_block into lines and skip if empty
+    lines = [ln.rstrip() for ln in (skills_block or "").splitlines() if ln.strip()]
+    if not lines:
+        # Nothing to insert; if JD provided core competencies, still insert them
+        if jd_core_competencies:
+            # prepare core competencies block from JD (merge with any existing resume ones)
+            existing_cores = []
+            # extract existing resume core lines (if any)
+            # simple parse: find existing heading earlier (if present)
+            # reuse _find_resume_core_lines logic-like approach inline
+            res_lines = (text or "").splitlines()
+            for i, ln in enumerate(res_lines):
+                if re.match(r"(?i)^\s*(core\s*competenc(?:ies|y)|core\s*skills)\s*[:\-–—]?\s*$", ln.strip()):
+                    # collect subsequent non-empty lines
+                    for j in range(i+1, len(res_lines)):
+                        nxt = res_lines[j].strip()
+                        if not nxt:
+                            break
+                        if re.match(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", nxt):
+                            break
+                        parts = [p.strip() for p in re.split(r",|\u2022|;|\t", nxt) if p.strip()]
+                        if parts:
+                            for p in parts:
+                                if p not in existing_cores:
+                                    existing_cores.append(p)
+                        else:
+                            if nxt not in existing_cores:
+                                existing_cores.append(nxt)
+                    break
+            # merge JD cores (only add JD items not already present)
+            merged = list(existing_cores)
+            for jd_item in jd_core_competencies:
+                if jd_item not in merged:
+                    merged.append(jd_item)
+            # build block and insert after summary (reuse insertion logic below)
+            skills_block_to_insert = "Core Competencies\n" + "\n".join(merged)
+        else:
+            return text
+    else:
+        # If lines are present, produce block that includes Core Competencies if provided
+        if lines[0].strip().lower().startswith("technical"):
+            block_body_lines = lines[1:] if lines[0].strip().lower().startswith("technical") else lines
+        else:
+            block_body_lines = lines
+
+        # Build core competencies block if JD has them
+        if jd_core_competencies:
+            # Find existing resume core entries to merge
+            existing_cores = []
+            res_lines = (text or "").splitlines()
+            for i, ln in enumerate(res_lines):
+                if re.match(r"(?i)^\s*(core\s*competenc(?:ies|y)|core\s*skills)\s*[:\-–—]?\s*$", ln.strip()):
+                    for j in range(i+1, len(res_lines)):
+                        nxt = res_lines[j].strip()
+                        if not nxt:
+                            break
+                        if re.match(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", nxt):
+                            break
+                        parts = [p.strip() for p in re.split(r",|\u2022|;|\t", nxt) if p.strip()]
+                        if parts:
+                            for p in parts:
+                                if p not in existing_cores:
+                                    existing_cores.append(p)
+                        else:
+                            if nxt not in existing_cores:
+                                existing_cores.append(nxt)
+                    break
+            merged_cores = list(existing_cores)
+            for jd_item in jd_core_competencies:
+                if jd_item not in merged_cores:
+                    merged_cores.append(jd_item)
+            # assemble final block: Core Competencies (if any), then Technical Skills lines
+            block_lines = []
+            if merged_cores:
+                block_lines.append("Core Competencies: " + ", ".join(merged_cores))
+            # Append the rest (normalize headings -> Technical Skills below will be added)
+            # If the LLM supplied headings in skills_block, keep them as-is
+            block_lines.extend(block_body_lines)
+            skills_block_to_insert = "\n".join(block_lines)
+        else:
+            # No JD cores: straightforward block is just skills_block (wrapped under Technical Skills later)
+            skills_block_to_insert = "\n".join(lines)
+
+    # Ensure the inserted block is prefixed with "Technical Skills" if not already
+    if not skills_block_to_insert.strip().lower().startswith("technical") and not skills_block_to_insert.strip().lower().startswith("core"):
+        skills_block_to_insert = "Technical Skills\n" + skills_block_to_insert
+
+    # Insert after Profile Summary if present (same as prior behavior)
+    summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
+    m = summary_heading_re.search(text)
+    if m:
+        head_end = m.end()
+        after = text[head_end:]
+        nxt = re.search(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
+        insert_pos = head_end + (nxt.start() if nxt else len(after))
+        new_text = text[:insert_pos].rstrip() + "\n\n" + skills_block_to_insert + "\n\n" + text[insert_pos:].lstrip()
+        return new_text
+
+    # fallback: insert after first non-empty line (name/contacts)
+    parts = text.splitlines()
+    idx = 0
+    while idx < len(parts) and not parts[idx].strip():
+        idx += 1
+    insert_at = min(len(parts), idx + 1)
+    new_lines = parts[:insert_at] + ["", skills_block_to_insert, ""] + parts[insert_at:]
+    return "\n".join(new_lines).strip()
+
 
 # -----------------------------
 # Tailor (JSON-first, fallback)
