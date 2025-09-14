@@ -102,6 +102,37 @@ This tool automates the process by combining **LLM intelligence** with ATS check
 
 ## ⚙️ Configuration
 
+### 🔧 Parameters Explained
+
+When running the AI models, two important parameters can be tuned in the sidebar:
+
+#### **1. Temperature**
+- Controls the **creativity vs. consistency** of AI responses.
+- **Low values (0.0 – 0.3)** → More **deterministic and precise**. Best for extracting keywords, ATS analysis, or when you want repeatable results.
+- **Medium values (0.4 – 0.7)** → Balanced. Useful for resume tailoring where some rewriting is needed but accuracy is still important.
+- **High values (0.8 – 1.0)** → More **creative and varied** outputs. Can be useful for brainstorming summaries, but may introduce unnecessary fluff.
+
+👉 **Recommendation:** Keep it between **0.2 – 0.5** for resume tasks.
+
+---
+
+#### **2. Max Tokens**
+- Defines the **maximum length** of the AI’s response (in tokens).
+- 1 token ≈ ¾ of a word (e.g., `256 tokens ≈ 190 words`).
+- If too **low** → the output may get **cut off** mid-sentence or miss details.
+- If too **high** → the model may generate overly long text and waste credits.
+
+👉 **Recommendation:**
+- **500–800 tokens** for keyword extraction & analysis.  
+- **1000–1500 tokens** for full resume tailoring and document rewriting.  
+
+---
+
+⚡ **Quick Rule of Thumb:**
+- **Temperature = controls style** (creative vs accurate).  
+- **Max Tokens = controls size** (how much text you’ll get back).  
+
+
 All configuration is handled in the **sidebar**:
 
 * **API Keys**: Paste your key for OpenAI, Gemini, or Anthropic.
