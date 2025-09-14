@@ -1036,25 +1036,6 @@ def polish_core_competencies(original_bullets: str, new_bullets: str,
     raw = provider.chat(model=model_name, system=SYSTEM_CORE_COMPETENCIES_POLISH, user=user, temperature=temperature, max_tokens=min(max_tokens, 900))
     return sanitize_markdown(raw or "").strip()
 
-# -----------------------------
-# Technical Skills insertion utility
-# -----------------------------
-def _remove_core_competencies_section(text: str) -> str:
-    """
-    Remove the first Core Competencies section (heading + body) if present.
-    """
-    if not text:
-        return text
-    pattern = re.compile(r"(?im)^\s*core[\s\-_:]*competencies\s*[:\-–—]?\s*$")
-    m = pattern.search(text)
-    if not m:
-        return text
-    start = m.start()
-    end = m.end()
-    after = text[end:]
-    nxt = re.search(r"(?im)^\s*(skills|technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
-    block_end = end + (nxt.start() if nxt else len(after))
-    return (text[:start] + text[block_end:]).strip()
 
 
 # -----------------------------
@@ -1240,6 +1221,7 @@ def _parse_block_to_headings(block: str) -> Dict[str, List[str]]:
             del out[h]
     return out
 
+
 def _merge_preserve_resume(resume_text: str, parsed_new: Dict[str, List[str]]) -> Dict[str, List[str]]:
     """
     Read existing resume Technical Skills sections, preserve them exactly,
@@ -1338,200 +1320,286 @@ def _render_skills_block(merged: Dict[str, Any]) -> str:
         return "Technical Skills"
     return "Technical Skills\n" + "\n".join(out_lines)
 
-def insert_technical_skills(full_text: str, skills_block: str) -> str:
+# ---------- NEW helpers for robust merge+insert ----------
+def _collect_existing_skill_blocks(text: str):
     """
-    Replace or insert Technical Skills while preserving existing technical skills exactly.
-    - Remove Core Competencies (kept behavior)
-    - If existing Technical Skills present, replace its body with merged block that preserves
-      original items and appends new ones (no reordering of original items).
-    - If no Technical Skills heading, insert near Summary or top preserving resume structure.
+    Find all existing skill-like blocks (Technical Skills, Skills, Core Competencies),
+    parse their contents into a dict {heading: [items...]}, preserve order, and return:
+      cleaned_text (with those blocks removed), existing_parsed (dict), headings_order (list)
     """
-    if not full_text:
-        return full_text
-    text = full_text
+    if not text:
+        return text, {}, []
 
-    # remove core competencies only (preserve existing skills)
-    text = _remove_core_competencies_section(text)
+    heading_pat = re.compile(r"(?im)^\s*(technical\s*skills|skills|core\s*competenc(?:ies|y))\s*[:\-–—]?\s*$", re.M)
+    next_section_pat = re.compile(
+        r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications|profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$",
+        re.M
+    )
 
-    # parse incoming skills block into headings->items
-    parsed_new = _parse_block_to_headings(skills_block or "")
+    matches = list(heading_pat.finditer(text))
+    if not matches:
+        return text, {}, []
 
-    # if incoming block is empty, just return text (no destructive change)
-    if not parsed_new:
-        return text
+    ranges = []
+    accumulated = {}  # heading -> [items]
+    headings_order = []
 
-    # merge with resume existing skill headings preserving original items & order
-    merged = _merge_preserve_resume(text, parsed_new)
-    block = _render_skills_block(merged)
-
-    # replace existing Technical Skills if present
-    pattern = re.compile(r"(?im)^\s*technical\s*skills\s*[:\-–—]?\s*$")
-    m = pattern.search(text or "")
-    if m:
+    for m in matches:
+        hname = m.group(1).strip()
         start = m.start()
         end = m.end()
         after = text[end:]
-        nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications|profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$", after)
-        section_end = end + (nxt.start() if nxt else len(after))
-        head = text[:end].rstrip()
-        tail = text[section_end:].lstrip("\n")
-        new_text = (head + "\n" + block + "\n\n" + tail).strip()
-        return new_text
-    else:
-        # If no Technical Skills heading, try to insert after Summary or after Contact block (first non-empty line)
-        summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
-        m2 = summary_heading_re.search(text)
-        if m2:
-            head_end = m2.end()
-            after = text[head_end:]
-            nxt = re.search(r"(?im)^\s*(work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
-            insert_pos = head_end + (nxt.start() if nxt else len(after))
-            new_text = text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip()
-            return new_text
-        else:
-            # fallback: insert near the top after first non-empty line
-            parts = text.splitlines()
-            idx = 0
-            while idx < len(parts) and not parts[idx].strip():
-                idx += 1
-            insert_at = min(len(parts), idx + 1)
-            new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
-            return "\n".join(new_lines).strip()
+        nxt = next_section_pat.search(after)
+        block_end = end + (nxt.start() if nxt else len(after))
+        ranges.append((start, block_end))
 
-def insert_technical_skills_after_summary(full_text: str, skills_block: str,
-                                         jd_core_competencies: Optional[List[str]] = None) -> str:
+        # body lines (excluding the heading line)
+        body = text[end:block_end]
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+
+        # parse each line: "Heading: a, b" OR bullets/comma lists -> attach under hname
+        for ln in lines:
+            # If line contains a ":" treat as sub-heading line
+            if ":" in ln:
+                left, right = ln.split(":", 1)
+                subh = left.strip()
+                items = [p.strip() for p in re.split(r",|\u2022|;|\t", right) if p.strip()]
+                if items:
+                    if subh not in accumulated:
+                        accumulated[subh] = []
+                        headings_order.append(subh)
+                    for it in items:
+                        if it and it not in accumulated[subh]:
+                            accumulated[subh].append(it)
+            else:
+                # plain bullets or comma separated items -> attach under main heading hname
+                parts = [p.strip() for p in re.split(r",|\u2022|;|\t", ln) if p.strip()]
+                if parts:
+                    if hname not in accumulated:
+                        accumulated[hname] = []
+                        headings_order.append(hname)
+                    for it in parts:
+                        if it and it not in accumulated[hname]:
+                            accumulated[hname].append(it)
+
+    # remove ranges from text (build new text skipping those ranges)
+    if not ranges:
+        return text, accumulated, headings_order
+
+    ranges = sorted(ranges, key=lambda x: x[0])
+    out_parts = []
+    cursor = 0
+    for (s, e) in ranges:
+        if cursor < s:
+            out_parts.append(text[cursor:s])
+        cursor = max(cursor, e)
+    if cursor < len(text):
+        out_parts.append(text[cursor:])
+    cleaned = "".join(out_parts).strip()
+    return cleaned, accumulated, headings_order
+
+
+def _merge_parsed_skill_dicts(existing: Dict[str, List[str]], new: Dict[str, List[str]]):
     """
-    Ensure exactly one Technical Skills block: remove Core Competencies and any existing
-    Technical Skills sections, then insert the supplied skills_block immediately after
-    the Profile Summary (or after name/contacts if no summary).
+    Merge two heading->items dicts:
+    - keep existing headings & their items (order preserved)
+    - append items from `new` into existing heading if missing (case-insensitive)
+    - append new headings (in their order) at the end if not present
+    Returns merged dict and headings order list.
+    """
+    merged = {}
+    headings = []
 
-    Behavior tweak:
-    - If jd_core_competencies is provided and non-empty:
-        * Preserve any existing resume Core Competencies and MERGE JD core competencies
-          (JD items are inserted above Technical Skills under a 'Core Competencies' heading).
-    - If jd_core_competencies is None or empty:
-        * Remove any existing Core Competencies sections from the resume (do not preserve).
+    # helper lower mapping for existing headings to match case-insensitively
+    existing_heading_map = {h.lower(): h for h in (existing.keys() or [])}
+
+    # start with existing headings & items
+    for h in (existing.keys() or []):
+        items = existing.get(h, []) or []
+        seen = set()
+        kept = []
+        for it in items:
+            if not isinstance(it, str):
+                it = str(it)
+            key = it.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            kept.append(it.strip())
+        if kept:
+            merged[h] = kept
+            headings.append(h)
+
+    # now merge new items into existing headings where the heading matches (case-insensitive)
+    for nh in (new.keys() or []):
+        nitems = new.get(nh, []) or []
+        # find matching existing heading (case-insensitive)
+        match_h = existing_heading_map.get(nh.lower())
+        if match_h:
+            exist_items = merged.setdefault(match_h, [])
+            exist_seen = {it.lower() for it in exist_items}
+            for it in nitems:
+                if not it: continue
+                if it.strip().lower() not in exist_seen:
+                    exist_items.append(it.strip()); exist_seen.add(it.strip().lower())
+        else:
+            # new heading not present in existing: add at end
+            cleaned = []
+            seen_local = set()
+            for it in nitems:
+                if not it: continue
+                k = it.strip().lower()
+                if k in seen_local: continue
+                seen_local.add(k); cleaned.append(it.strip())
+            if cleaned:
+                merged[nh] = cleaned
+                headings.append(nh)
+
+    return merged, headings
+
+
+def _global_dedupe_preserve_order(headings: List[str], skills_map: Dict[str, List[str]]):
+    """
+    Remove duplicate skill tokens across headings (case-insensitive).
+    Keep first-seen occurrence (heading order then item order).
+    Returns deduped headings list and skills_map.
+    """
+    global_seen = set()
+    deduped_headings = []
+    deduped_skills = {}
+
+    for h in headings:
+        items = skills_map.get(h, []) or []
+        new_items = []
+        for it in items:
+            if not it: continue
+            key = it.strip().lower()
+            if key in global_seen:
+                continue
+            global_seen.add(key)
+            new_items.append(it.strip())
+        if new_items:
+            deduped_headings.append(h)
+            deduped_skills[h] = new_items
+
+    return deduped_headings, deduped_skills
+
+
+def _merge_and_insert_skills(full_text: str, skills_block: str,
+                             jd_core_competencies: Optional[List[str]] = None,
+                             prefer_after_summary: bool = True) -> str:
+    """
+    Robust routine:
+    1) Collect all existing skill blocks (without losing content).
+    2) Parse incoming skills_block.
+    3) Merge existing + incoming (preserve order, append new items).
+    4) Merge JD core competencies if provided under "Core Competencies".
+    5) Dedupe globally (case-insensitive).
+    6) Render a single block and insert (prefer after summary if requested).
     """
     if not full_text:
         return full_text
 
     text = full_text
 
-    # If JD did NOT provide core competencies, remove existing Core Competencies
-    if not jd_core_competencies:
-        text = _remove_core_competencies_section(text)
-    # If JD provided core competencies, preserve existing resume Core Competencies (don't remove),
-    # but we'll later ensure merging/insertion happens.
+    # 1) collect & strip existing blocks
+    cleaned_text, existing_parsed, existing_order = _collect_existing_skill_blocks(text)
 
-    # Always remove existing Technical Skills to avoid duplicates (we will re-insert)
-    text = _remove_technical_skills_section(text)
+    # 2) parse incoming block
+    parsed_new = _parse_block_to_headings(skills_block or "") or {}
 
-    # Normalize skills_block into lines and skip if empty
-    lines = [ln.rstrip() for ln in (skills_block or "").splitlines() if ln.strip()]
-    if not lines:
-        # Nothing to insert; if JD provided core competencies, still insert them
-        if jd_core_competencies:
-            # prepare core competencies block from JD (merge with any existing resume ones)
-            existing_cores = []
-            # extract existing resume core lines (if any)
-            # simple parse: find existing heading earlier (if present)
-            # reuse _find_resume_core_lines logic-like approach inline
-            res_lines = (text or "").splitlines()
-            for i, ln in enumerate(res_lines):
-                if re.match(r"(?i)^\s*(core\s*competenc(?:ies|y)|core\s*skills)\s*[:\-–—]?\s*$", ln.strip()):
-                    # collect subsequent non-empty lines
-                    for j in range(i+1, len(res_lines)):
-                        nxt = res_lines[j].strip()
-                        if not nxt:
-                            break
-                        if re.match(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", nxt):
-                            break
-                        parts = [p.strip() for p in re.split(r",|\u2022|;|\t", nxt) if p.strip()]
-                        if parts:
-                            for p in parts:
-                                if p not in existing_cores:
-                                    existing_cores.append(p)
-                        else:
-                            if nxt not in existing_cores:
-                                existing_cores.append(nxt)
-                    break
-            # merge JD cores (only add JD items not already present)
-            merged = list(existing_cores)
-            for jd_item in jd_core_competencies:
-                if jd_item not in merged:
-                    merged.append(jd_item)
-            # build block and insert after summary (reuse insertion logic below)
-            skills_block_to_insert = "Core Competencies\n" + "\n".join(merged)
+    # if incoming empty but JD cores provided, make parsed_new hold them
+    if (not parsed_new) and jd_core_competencies:
+        parsed_new = {"Core Competencies": list(jd_core_competencies)}
+
+    # 3) merge existing & new
+    merged_map, merged_headings = _merge_parsed_skill_dicts(existing_parsed, parsed_new)
+
+    # 4) merge JD core competencies into merged_map under canonical heading
+    if jd_core_competencies:
+        core_key = None
+        # try to find existing core heading key case-insensitively
+        for h in merged_headings:
+            if h.lower().startswith("core"):
+                core_key = h; break
+        if not core_key:
+            core_key = "Core Competencies"
+            # insert core_key near the front (prefer before Technical Skills)
+            if core_key not in merged_headings:
+                merged_headings.insert(0, core_key)
+        cur = merged_map.get(core_key, [])
+        cur_lower = {c.lower() for c in cur}
+        for jd_item in jd_core_competencies or []:
+            if jd_item and jd_item.strip() and jd_item.lower() not in cur_lower:
+                cur.append(jd_item.strip()); cur_lower.add(jd_item.lower())
+        if cur:
+            merged_map[core_key] = cur
+
+    # 5) global dedupe
+    final_headings, final_map = _global_dedupe_preserve_order(merged_headings, merged_map)
+
+    # Ensure Technical Skills is present for fallback ordering if nothing else exists
+    if not final_headings:
+        # try to populate with tokens from parsed_new targets (if any)
+        fallback_items = []
+        for arr in (parsed_new.values() or []):
+            for it in arr:
+                if it and _is_short_skill(it):
+                    fallback_items.append(it.strip())
+        if fallback_items:
+            final_headings = ["Technical Skills"]
+            final_map = {"Technical Skills": _dedupe_preserve_order(fallback_items)}
         else:
-            return text
-    else:
-        # If lines are present, produce block that includes Core Competencies if provided
-        if lines[0].strip().lower().startswith("technical"):
-            block_body_lines = lines[1:] if lines[0].strip().lower().startswith("technical") else lines
-        else:
-            block_body_lines = lines
+            # nothing meaningful to insert
+            return cleaned_text
 
-        # Build core competencies block if JD has them
-        if jd_core_competencies:
-            # Find existing resume core entries to merge
-            existing_cores = []
-            res_lines = (text or "").splitlines()
-            for i, ln in enumerate(res_lines):
-                if re.match(r"(?i)^\s*(core\s*competenc(?:ies|y)|core\s*skills)\s*[:\-–—]?\s*$", ln.strip()):
-                    for j in range(i+1, len(res_lines)):
-                        nxt = res_lines[j].strip()
-                        if not nxt:
-                            break
-                        if re.match(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", nxt):
-                            break
-                        parts = [p.strip() for p in re.split(r",|\u2022|;|\t", nxt) if p.strip()]
-                        if parts:
-                            for p in parts:
-                                if p not in existing_cores:
-                                    existing_cores.append(p)
-                        else:
-                            if nxt not in existing_cores:
-                                existing_cores.append(nxt)
-                    break
-            merged_cores = list(existing_cores)
-            for jd_item in jd_core_competencies:
-                if jd_item not in merged_cores:
-                    merged_cores.append(jd_item)
-            # assemble final block: Core Competencies (if any), then Technical Skills lines
-            block_lines = []
-            if merged_cores:
-                block_lines.append("Core Competencies: " + ", ".join(merged_cores))
-            # Append the rest (normalize headings -> Technical Skills below will be added)
-            # If the LLM supplied headings in skills_block, keep them as-is
-            block_lines.extend(block_body_lines)
-            skills_block_to_insert = "\n".join(block_lines)
-        else:
-            # No JD cores: straightforward block is just skills_block (wrapped under Technical Skills later)
-            skills_block_to_insert = "\n".join(lines)
+    # 6) ensure "Technical Skills" heading exists (if not present, appended at end)
+    if not any(h.lower().startswith("technical") for h in final_headings):
+        final_headings.append("Technical Skills")
+        # if there are no items under Technical Skills, nothing to add there (ok)
 
-    # Ensure the inserted block is prefixed with "Technical Skills" if not already
-    if not skills_block_to_insert.strip().lower().startswith("technical") and not skills_block_to_insert.strip().lower().startswith("core"):
-        skills_block_to_insert = "Technical Skills\n" + skills_block_to_insert
+    # Build merged structure compatible with _render_skills_block
+    merged_struct = {"headings": final_headings, "skills": final_map}
+    block = _render_skills_block(merged_struct)
 
-    # Insert after Profile Summary if present (same as prior behavior)
-    summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
-    m = summary_heading_re.search(text)
-    if m:
-        head_end = m.end()
-        after = text[head_end:]
-        nxt = re.search(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
-        insert_pos = head_end + (nxt.start() if nxt else len(after))
-        new_text = text[:insert_pos].rstrip() + "\n\n" + skills_block_to_insert + "\n\n" + text[insert_pos:].lstrip()
-        return new_text
+    # 7) Insert block into cleaned_text
+    # Prefer inserting after Profile Summary heading if requested
+    if prefer_after_summary:
+        summary_heading_re = re.compile(r"(?im)^\s*(profile\s*summary|professional\s*summary|summary)\s*[:\-–—]?\s*$")
+        m = summary_heading_re.search(cleaned_text)
+        if m:
+            head_end = m.end()
+            after = cleaned_text[head_end:]
+            nxt = re.search(r"(?im)^\s*(technical\s*skills|work\s*experience|experience|education|projects|certifications|awards|publications)\s*[:\-–—]?\s*$", after)
+            insert_pos = head_end + (nxt.start() if nxt else len(after))
+            new_text = cleaned_text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + cleaned_text[insert_pos:].lstrip()
+            return new_text
 
     # fallback: insert after first non-empty line (name/contacts)
-    parts = text.splitlines()
+    parts = cleaned_text.splitlines()
     idx = 0
     while idx < len(parts) and not parts[idx].strip():
         idx += 1
     insert_at = min(len(parts), idx + 1)
-    new_lines = parts[:insert_at] + ["", skills_block_to_insert, ""] + parts[insert_at:]
+    new_lines = parts[:insert_at] + ["", block, ""] + parts[insert_at:]
     return "\n".join(new_lines).strip()
+
+
+# ---------- Replacements / wrappers (keeps your original API) ----------
+def insert_technical_skills(full_text: str, skills_block: str) -> str:
+    """
+    Backwards-compatible: merge skill block into resume but do not create duplicates.
+    Default behavior: insert near Summary or at top (same as previous).
+    """
+    return _merge_and_insert_skills(full_text, skills_block, jd_core_competencies=None, prefer_after_summary=False)
+
+
+def insert_technical_skills_after_summary(full_text: str, skills_block: str,
+                                         jd_core_competencies: Optional[List[str]] = None) -> str:
+    """
+    Backwards-compatible wrapper that prefers inserting after the Profile Summary.
+    """
+    return _merge_and_insert_skills(full_text, skills_block, jd_core_competencies=jd_core_competencies, prefer_after_summary=True)
 
 
 # -----------------------------
