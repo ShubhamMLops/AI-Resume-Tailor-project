@@ -15,6 +15,69 @@ from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
 
 # -----------------------------
+# Keyword object sanitizer (add right after imports)
+# -----------------------------
+from typing import Iterable
+
+# -----------------------------
+# Keyword normalization helper
+# -----------------------------
+def _normalize_keyword_list(raw_kw_list):
+    """
+    Ensure keywords list is a list of dicts with stable keys:
+    { "term": str, "variants": [str], "evidence": [str], "rank": int|None, "category": str }
+    If input is malformed, convert safely. Returns list (possibly empty).
+    """
+    out = []
+    if not raw_kw_list:
+        return out
+    # if single dict provided
+    if isinstance(raw_kw_list, dict):
+        raw_kw_list = [raw_kw_list]
+    # if it's a string, return empty
+    if isinstance(raw_kw_list, str):
+        return out
+    for item in raw_kw_list:
+        try:
+            if not isinstance(item, dict):
+                # if item is a simple string, convert to minimal dict
+                if isinstance(item, str) and item.strip():
+                    out.append({"term": item.strip(), "variants": [], "evidence": [], "rank": None, "category": ""})
+                continue
+            term = (item.get("term") or "") if item.get("term") is not None else ""
+            # normalize types
+            if not isinstance(term, str):
+                term = str(term)
+            variants = item.get("variants") or []
+            if not isinstance(variants, list):
+                variants = [variants] if variants else []
+            variants = [str(v).strip() for v in variants if v is not None and str(v).strip()]
+            evidence = item.get("evidence") or []
+            if not isinstance(evidence, list):
+                evidence = [evidence] if evidence else []
+            evidence = [str(e).strip() for e in evidence if e is not None and str(e).strip()]
+            rank = item.get("rank")
+            try:
+                rank = int(rank) if rank is not None else None
+            except Exception:
+                rank = None
+            category = (item.get("category") or "") if item.get("category") is not None else ""
+            if not isinstance(category, str):
+                category = str(category)
+            out.append({
+                "term": term.strip(),
+                "variants": variants,
+                "evidence": evidence,
+                "rank": rank,
+                "category": category.strip()
+            })
+        except Exception:
+            # skip malformed entries silently (but could log)
+            continue
+    return out
+
+
+# -----------------------------
 # Regex helpers
 # -----------------------------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -267,353 +330,504 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                          provider_pref: Optional[str], model_name: Optional[str],
                          temperature: float, max_tokens: int, keys: Dict[str, str]) -> Dict[str, Any]:
     """
-    Run LLM keyword extractor, but post-filter results so that only terms/variants
-    that actually appear in the provided JD are kept.
-
-    Domain-agnostic behavior:
-    - No stoplist or domain-specific filtering.
-    - Strict presence rules:
-      * single-word: sequential token match OR compact match
-      * multi-word: exact sequential match OR all tokens present somewhere OR compact match
-    - Returns obj with 'keywords' filtered and '_filtered_out' listing removed entries.
+    LLM-assisted extraction with strict deterministic validation, ranking, and gap detection.
+    Defensive: tolerant to malformed LLM outputs (missing 'term', missing 'evidence', etc.)
+    This version also:
+      - safely supplies top_k to the USER_KEYWORDS prompt when available
+      - guarantees 'raw' is always defined (prevents local-variable access errors)
     """
-    provider = _provider_from_keys(provider_pref, keys)
-    # Convert raw JD to normalized JSON via LLM (for more stable downstream extraction).
+    provider = _provider_from_keys(provider_pref, keys or {})
+    # 1) Normalize JD via jd_to_json_via_llm for stable line/evidence handling
     _jd_json = jd_to_json_via_llm(jd_text, provider, model_name, temperature=0.0, max_tokens=800)
-    # Print the JD JSON to terminal (not GUI)
+    jd_flat = _jd_json.get("flat", jd_text or "")
+    jd_lines = [ln.get("text", "").strip() for ln in (_jd_json.get("lines") or []) if ln.get("text")]
+    total_jd_lines = max(1, len(jd_lines))
+
     print("\n=== NORMALIZED JD JSON (used for extraction) ===")
-    print(json.dumps(_jd_json, indent=2, ensure_ascii=False))
+    try:
+        print(json.dumps(_jd_json, indent=2, ensure_ascii=False))
+    except Exception:
+        print(repr(_jd_json))
     print("==============================================\n")
-    # Replace jd_text with the normalized flat representation for downstream use
-    jd_text = _jd_json.get("flat", jd_text)
 
-
-    # If JD is empty, return a clean empty structure immediately
-    if not (jd_text and jd_text.strip()):
+    if not jd_flat or not jd_flat.strip():
         return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": "", "_filtered_out": []}
 
-    raw = provider.chat(
-        model=model_name,
-        system=SYSTEM_KEYWORDS,
-        user=USER_KEYWORDS.format(jd=jd_text, resume=resume_text),
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
+    # decide top_k for extraction (tuneable)
+    top_k = 60 if (max_tokens is None or max_tokens >= 60) else max(10, int(max(10, max_tokens // 10)))
 
-    # normalize raw output and extract JSON safely
+    # 2) Ask LLM for candidate verbatim keywords (JSON-only)
+    from ai.prompts import SYSTEM_KEYWORDS, USER_KEYWORDS
+    # build user_payload robustly: try to provide top_k if the prompt includes it,
+    # otherwise fall back to the two-arg format (jd/resume).
+    try:
+        user_payload = USER_KEYWORDS.format(jd=jd_flat, resume=(resume_text or ""), top_k=top_k)
+    except Exception:
+        user_payload = USER_KEYWORDS.format(jd=jd_flat, resume=(resume_text or ""))
+
+    raw = ""  # Defensive init so 'raw' always exists
+    try:
+        raw = provider.chat(model=model_name, system=SYSTEM_KEYWORDS, user=user_payload, temperature=0.0, max_tokens=max_tokens or 800) or ""
+        if not isinstance(raw, str):
+            raw = str(raw or "")
+    except Exception as e:
+        # Log and continue to deterministic fallback below
+        print("Warning: provider.chat failed in extract_keywords_llm:", repr(e))
+        raw = ""
+
     raw = (raw or "").strip()
-
-    # remove common prefixes like "json" or ```json
+    # clean fences/prefixes
     if raw.lower().startswith("json"):
         raw = raw[4:].strip()
     if raw.startswith("```") and raw.endswith("```"):
         raw = raw.strip("`").strip()
 
-    # find first "{" and last "}"
-    start, end = raw.find("{"), raw.rfind("}") + 1
-    candidate = raw[start:end] if start != -1 and end > start else raw
-
-    # clean up common issues (trailing commas, smart quotes)
-    candidate = re.sub(r",\s*(\]|\})", r"\1", candidate)
-    candidate = candidate.replace("“", '"').replace("”", '"').replace("’", "'")
+    # extract first JSON block safely
+    candidate_block = _first_json_block(raw) or raw or "{}"
+    candidate_block = re.sub(r",\s*(\]|\})", r"\1", candidate_block)
+    candidate_block = candidate_block.replace("“", '"').replace("”", '"').replace("’", "'")
 
     try:
-        obj = json.loads(candidate)
-        raw = candidate
+        cand_obj = json.loads(candidate_block)
     except Exception:
-        obj = {"keywords": [], "missing": [], "weak": [], "summary": ""}
-        raw = json.dumps(obj)
+        cand_obj = {"keywords": []}
+    # Ensure cand_obj is a dict
+    if not isinstance(cand_obj, dict):
+        cand_obj = {"keywords": []}
 
-    # pretty-print parsed JSON to terminal/logs
-    try:
-        pretty = json.dumps(obj, indent=2, ensure_ascii=False)
-    except Exception:
-        pretty = raw  # fallback to raw string if obj isn't a dict
+    # Normalize candidate list
+    cand_list = cand_obj.get("keywords") if isinstance(cand_obj.get("keywords"), list) else []
+    normalized_candidates = []
+    for c in cand_list:
+        if not isinstance(c, dict):
+            # If candidate is a string entry, convert to dict
+            if isinstance(c, str) and c.strip():
+                normalized_candidates.append({"term": c.strip(), "variants": [], "evidence": [], "category": ""})
+            continue
+        term = (c.get("term") or "").strip() if c.get("term") is not None else ""
+        if not term:
+            # skip malformed entry; keep debug
+            continue
+        ev = [e for e in (c.get("evidence") or []) if isinstance(e, str) and e.strip()]
+        variants = [v for v in (c.get("variants") or []) if v and isinstance(v, str) and v.strip()]
+        category = (c.get("category") or "") if isinstance(c.get("category", ""), str) else ""
+        normalized_candidates.append({"term": term, "variants": variants, "evidence": ev, "category": category})
 
-    print("\n=== RAW LLM OUTPUT (cleaned & pretty) ===")
-    print(pretty)
-    print("======================\n")
-
-
-    # Normalize schema keys
-    if not isinstance(obj.get("keywords"), list):
-        obj["keywords"] = []
-    if not isinstance(obj.get("missing"), list):
-        obj["missing"] = []
-    if not isinstance(obj.get("weak"), list):
-        obj["weak"] = []
-    obj["summary"] = obj.get("summary", "")
-    obj["_raw_json"] = raw
-
-    # --- prepare JD tokens for strict matching (domain-agnostic) ---
+    # Deterministic matching helpers (same rules as SYSTEM prompt)
     token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    jd_tokens = [t.lower() for t in token_re.findall(jd_text or "")]
+    jd_tokens = [t.lower() for t in token_re.findall(jd_flat or "")]
     jd_compact = "".join(jd_tokens)
     jd_token_set = set(jd_tokens)
+    jd_lines_trimmed = [l.strip() for l in jd_lines]
 
-    def _tok_seq(s: str):
+    def tok_seq(s: str):
         return [t.lower() for t in token_re.findall(s or "")]
 
-    def _sequential_match(seq_tokens: List[str]) -> bool:
+    def sequential_match(seq_tokens: List[str], hay_tokens=jd_tokens) -> bool:
         if not seq_tokens:
             return False
         L = len(seq_tokens)
-        for i in range(0, len(jd_tokens) - L + 1):
-            if jd_tokens[i:i+L] == seq_tokens:
+        if L == 0:
+            return False
+        for i in range(0, len(hay_tokens) - L + 1):
+            if hay_tokens[i:i+L] == seq_tokens:
                 return True
         return False
 
-    def _all_tokens_present(seq_tokens: List[str]) -> bool:
+    def all_tokens_present(seq_tokens: List[str]) -> bool:
         if not seq_tokens:
             return False
         return all(tok in jd_token_set for tok in seq_tokens)
 
-    def _compact_match(seq_tokens: List[str]) -> bool:
+    def compact_match(seq_tokens: List[str]) -> bool:
         if not seq_tokens:
             return False
         return "".join(seq_tokens) in jd_compact
 
-    def _present_in_jd_strict(seq_tokens: List[str]) -> bool:
-        """
-        Strict presence rules (domain-agnostic):
-        - single token: sequential OR compact match
-        - multi-token: sequential OR all tokens present OR compact match
-        """
+    def present_in_jd_strict(seq_tokens: List[str]) -> bool:
         if not seq_tokens:
             return False
         if len(seq_tokens) == 1:
-            return _sequential_match(seq_tokens) or _compact_match(seq_tokens)
-        # multi-word
-        if _sequential_match(seq_tokens):
+            return sequential_match(seq_tokens) or compact_match(seq_tokens)
+        if sequential_match(seq_tokens):
             return True
-        if _all_tokens_present(seq_tokens):
+        if all_tokens_present(seq_tokens):
             return True
-        if _compact_match(seq_tokens):
+        if compact_match(seq_tokens):
             return True
         return False
 
-    # 2) Post-filter LLM keywords to ensure they actually appear in the JD (strict)
-    filtered_keywords = []
+    # Validate LLM candidates: evidence must include at least one exact JD line and term must be justifiable
+    validated = []
     filtered_out = []
+    for c in normalized_candidates:
+        term = c.get("term", "").strip()
+        if not term:
+            continue
+        variants = c.get("variants", []) or []
+        evidence = c.get("evidence", []) or []
 
-    for kw in (obj.get("keywords") or []):
-        term = (kw.get("term") or "").strip()
-        variants = [v for v in (kw.get("variants") or []) if v and v.strip()]
+        # evidence must match at least one JD line exactly (trimmed)
+        evidence_ok = False
+        matched_line_indexes = []
+        jd_lines_set = set(jd_lines_trimmed)
+        for ev in evidence:
+            if not isinstance(ev, str):
+                continue
+            ev_trim = ev.strip()
+            if ev_trim in jd_lines_set:
+                evidence_ok = True
+                for idx, jdln in enumerate(jd_lines_trimmed):
+                    if ev_trim == jdln:
+                        matched_line_indexes.append(idx)
+                        break
 
-        kept = False
+        # If evidence missing or didn't match any JD line, attempt to discover exact jd lines that contain the term verbatim
+        if not evidence_ok:
+            for idx, jdln in enumerate(jd_lines_trimmed):
+                if term in jdln:
+                    evidence_ok = True
+                    matched_line_indexes.append(idx)
 
-        # Check term itself (strict)
-        if term:
-            seq = _tok_seq(term)
-            if _present_in_jd_strict(seq):
-                kept = True
+        # token justification
+        term_seq = tok_seq(term)
+        term_found = present_in_jd_strict(term_seq)
 
-        # Check variants (strict)
-        if not kept:
-            for v in variants:
-                seqv = _tok_seq(v)
-                if _present_in_jd_strict(seqv):
-                    kept = True
-                    break
-
-        if kept:
-            safe_kw = {
-                "rank": kw.get("rank"),
-                "term": term,
-                "category": kw.get("category", ""),
-                "variants": variants
-            }
-            # preserve evidence if LLM provided it
-            if isinstance(kw.get("evidence"), list):
-                safe_kw["evidence"] = kw.get("evidence")
-            filtered_keywords.append(safe_kw)
+        # Accept only if evidence_ok AND term_found
+        if evidence_ok and term_found:
+            # normalize evidence: include unique exact jd lines where term appears
+            evs = []
+            for i in sorted(set(matched_line_indexes)):
+                if 0 <= i < len(jd_lines_trimmed):
+                    evs.append(jd_lines_trimmed[i])
+            if not evs:
+                # as a final attempt, include any JD lines that contain the term
+                for jdln in jd_lines_trimmed:
+                    if term in jdln:
+                        evs.append(jdln)
+            validated.append({"term": term, "variants": variants, "evidence": evs, "category": c.get("category","") or ""})
         else:
-            filtered_out.append({"term": term, "variants": variants, "reason": "not_in_jd"})
+            filtered_out.append({"term": term, "variants": variants, "reason": "evidence_or_justification_failed"})
 
-    obj["keywords"] = filtered_keywords
-    obj["_filtered_out"] = filtered_out
-
-    # 3) FALLBACK: if no keywords after filtering, run a deterministic JD line-by-line extractor
-    if not obj["keywords"]:
-        jd_lines = [ln.rstrip() for ln in (jd_text or "").splitlines() if ln.strip()]
-        fallback_keywords = []
+    # If LLM returned nothing valid, run conservative deterministic fallback
+    if not validated:
         seen = set()
-        rank = 1
-
-        # Helper: tech-like candidate checks and normalization
-        token_re_local = re.compile(r"[A-Za-z0-9\+#\-/\.]+")
-        stop_verbs = re.compile(r"\b(design|implement|maintain|develop|manage|ensure|work|automate|analyze|write|partner|integrate|provide|perform|configure)\b", re.I)
-        noise_words = {"responsibilities", "requirements", "experience", "responsibilit", "development", "management"}
-
-        def is_tech_candidate(s: str) -> bool:
-            s = s.strip().strip(",:;.-()[]")
-            if not s or len(s) <= 1:
-                return False
-            # reject obviously long prose (>7 words)
-            if len(s.split()) > 7:
-                return False
-            # reject pure verbs/prose lines
-            if stop_verbs.search(s):
-                # allow if the string contains clear tech tokens like '/' (RDS/DynamoDB) or dots or '+' or capitalized acronym
-                if not re.search(r"[/#\.+]|[A-Z]{2,}", s):
-                    return False
-            # must contain at least one alpha/numeric token of length >=2
-            toks = token_re_local.findall(s)
-            if not toks:
-                return False
-            if all(len(t) <= 1 for t in toks):
-                return False
-            # filter out generic headings/noise
-            low = s.lower()
-            if any(w in low for w in noise_words):
-                return False
-            return True
-
-        # Preferred extraction strategy:
-        # 1) split on common separators (commas, 'such as', 'e.g.', 'or', ';')
-        # 2) also capture slash tokens (RDS/DynamoDB), parentheses content, and short phrases (<=4 tokens)
-        sep_re = re.compile(r",|\band\b|\bor\b|\bsuch as\b|\be\.g\.\b|;|\u2022", re.I)
-        slash_or_paren_re = re.compile(r"[A-Za-z0-9\+#\-/\.]{2,}(?:/[A-Za-z0-9\+#\-/\.]{2,})?")
-
-        for line in jd_lines:
-            # 1. extract parenthetical content first (e.g., "(Jenkins, Bitbucket, Git)")
+        fallback = []
+        token_re_local = re.compile(r"[A-Za-z0-9\+#\-/\.]{2,}")
+        for idx, line in enumerate(jd_lines_trimmed):
+            if not line:
+                continue
+            # 1) parenthetical content
             for par in re.findall(r"\(([^)]+)\)", line):
-                for part in sep_re.split(par):
-                    cand = part.strip()
-                    if not cand:
+                parts = [p.strip() for p in re.split(r",|\u2022|;|\band\b|\bor\b", par) if p.strip()]
+                for p in parts:
+                    if len(p) < 2:
                         continue
-                    if not is_tech_candidate(cand):
-                        continue
-                    key = cand.lower()
-                    if key in seen:
+                    key = re.sub(r"[^A-Za-z0-9]+"," ", p).strip().lower()
+                    if not key or key in seen:
                         continue
                     seen.add(key)
-                    fallback_keywords.append({"rank": rank, "term": cand, "category": "", "variants": [], "evidence": [line]})
-                    rank += 1
-                    if rank > 50:
-                        break
-                if rank > 50:
-                    break
-            if rank > 50:
-                break
-
-            # 2. split line on separators to get short candidate fragments
-            parts = [p.strip() for p in sep_re.split(line) if p.strip()]
-            for part in parts:
-                # further split long fragments by "such as" or "e.g." already handled; check slash tokens
-                # capture explicit slash tokens
-                for m in slash_or_paren_re.finditer(part):
-                    cand = m.group(0).strip().strip(",:;.-")
-                    if not cand or len(cand) <= 1:
-                        continue
-                    if not is_tech_candidate(cand):
-                        continue
-                    key = cand.lower()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    fallback_keywords.append({"rank": rank, "term": cand, "category": "", "variants": [], "evidence": [line]})
-                    rank += 1
-                    if rank > 50:
-                        break
-                if rank > 50:
-                    break
-
-                # If no slash-like tokens, consider short phrase fragments (<=4 tokens)
-                words = [w for w in token_re_local.findall(part)]
+                    fallback.append({"term": p, "variants": [], "evidence": [line], "category": ""})
+            # 2) slash-like tokens and explicit tokens
+            for m in token_re_local.finditer(line):
+                cand = m.group(0).strip().strip(",:;.-")
+                if len(cand) < 2:
+                    continue
+                key = re.sub(r"[^A-Za-z0-9]+"," ", cand).strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                fallback.append({"term": cand, "variants": [], "evidence": [line], "category": ""})
+            # 3) comma-separated short fragments
+            parts = [p.strip() for p in re.split(r",|\u2022|;|\band\b|\bor\b", line) if p.strip()]
+            for p in parts:
+                words = token_re_local.findall(p)
                 if 0 < len(words) <= 4:
                     cand = " ".join(words)
-                    if not cand:
-                        continue
-                    if not is_tech_candidate(cand):
-                        continue
-                    key = cand.lower()
-                    if key in seen:
+                    key = re.sub(r"[^A-Za-z0-9]+"," ", cand).strip().lower()
+                    if not key or key in seen:
                         continue
                     seen.add(key)
-                    fallback_keywords.append({"rank": rank, "term": cand, "category": "", "variants": [], "evidence": [line]})
-                    rank += 1
-                    if rank > 50:
-                        break
-            if rank > 50:
+                    fallback.append({"term": cand, "variants": [], "evidence": [line], "category": ""})
+        # cap fallback
+        validated = fallback[:80]
+
+    # Now compute deterministic ranking for validated list
+    ranked = []
+    for item in validated:
+        term = (item.get("term") or "").strip()
+        if not term:
+            continue
+        ev_lines = item.get("evidence", []) or []
+        # frequency = distinct JD lines where term appears
+        freq_set = set()
+        for idx, jdln in enumerate(jd_lines_trimmed):
+            if term in jdln:
+                freq_set.add(idx)
+        frequency = len(freq_set) if freq_set else max(1, len(ev_lines) or 1)
+        # heuristics
+        required_bonus = 0
+        preferred_bonus = 0
+        heading_boost = 0
+        earliest_idx = min(list(freq_set)) if freq_set else (total_jd_lines + 1)
+        for idx in list(freq_set):
+            ln = jd_lines_trimmed[idx].lower()
+            if any(x in ln for x in ("required", "must", "essential", "responsible for")):
+                required_bonus = 1
+            if any(x in ln for x in ("preferred", "nice to have", "optional")):
+                preferred_bonus = 1
+            for back in range(max(0, idx-2), idx):
+                hdr = jd_lines_trimmed[back].strip()
+                if re.match(r"(?i)^(core\s*competenc(?:ies|y)|technical\s*skills|skills|expertise)\s*[:\-–—]?$", hdr):
+                    heading_boost = 1
+                    break
+        early_pos_bonus = 1 if earliest_idx < max(1, int((0.1 * total_jd_lines))) else 0
+        score = 3 * frequency + 5 * required_bonus + 1 * preferred_bonus + 2 * early_pos_bonus + 2 * heading_boost
+        ranked.append({"term": term, "variants": item.get("variants",[]), "evidence": item.get("evidence",[]), "category": item.get("category","") or "Other", "score": score, "earliest_idx": earliest_idx})
+
+    # Sort by score desc, tie-break earliest_idx asc
+    ranked.sort(key=lambda x: (-x.get("score", 0), x.get("earliest_idx", total_jd_lines + 1)))
+
+    # Build final keywords list with ranks and normalized fields
+    final_kw = []
+    seen_terms = set()
+    for i, ent in enumerate(ranked, start=1):
+        t = (ent.get("term") or "").strip()
+        if not t:
+            continue
+        key = re.sub(r"[^A-Za-z0-9]+", " ", t).strip().lower()
+        if not key or key in seen_terms:
+            continue
+        seen_terms.add(key)
+        variants = [v for v in (ent.get("variants") or []) if v and isinstance(v, str) and v.strip()]
+        evidence = [e for e in (ent.get("evidence") or []) if isinstance(e, str) and e.strip()]
+        category = ent.get("category") or "Other"
+        final_kw.append({"rank": i, "term": t, "category": category, "variants": variants, "evidence": evidence})
+
+    # Build missing/weak lists by comparing to resume deterministically
+    res_token_re = re.compile(r"[A-Za-z0-9#+.]+")
+    resume_tokens = [t.lower() for t in res_token_re.findall(resume_text or "")]
+    resume_compact = "".join(resume_tokens)
+
+    def present_in_resume_strict(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        L = len(seq_tokens)
+        if L == 0:
+            return False
+        for i in range(0, len(resume_tokens) - L + 1):
+            if resume_tokens[i:i+L] == seq_tokens:
+                return True
+        if "".join(seq_tokens) in resume_compact:
+            return True
+        if L == 1 and len(seq_tokens[0]) > 3:
+            base = seq_tokens[0]; alt = base[:-1] if base.endswith("s") else base + "s"
+            if base in resume_tokens or alt in resume_tokens:
+                return True
+        return False
+
+    def compact_only_in_resume(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        if present_in_resume_strict(seq_tokens):
+            return False
+        return "".join(seq_tokens) in resume_compact
+
+    missing = []
+    weak = []
+    top_candidates = final_kw[:60]
+    for ent in top_candidates:
+        seq = tok_seq(ent.get("term", ""))
+        if not seq:
+            continue
+        if not present_in_resume_strict(seq):
+            if compact_only_in_resume(seq):
+                weak.append(ent["term"])
+            else:
+                missing.append(ent["term"])
+
+    def dedupe_list(arr, limit=None):
+        out=[]; seen=set()
+        for x in arr:
+            if not isinstance(x, str):
+                continue
+            k = x.strip().lower()
+            if not k or k in seen:
+                continue
+            seen.add(k); out.append(x)
+            if limit and len(out) >= limit:
                 break
+        return out
 
-        # Final cleanup: prefer shorter, clearly-technical tokens and limit results
-        cleaned = []
-        seen_c = set()
-        for ent in fallback_keywords:
-            t = ent["term"].strip()
-            # prefer tokens with letters/digits and reasonable length
-            if len(t) < 2 or len(t) > 70:
-                continue
-            # avoid pure stop-verb fragments
-            if stop_verbs.fullmatch(t):
-                continue
-            k = t.lower()
-            if k in seen_c:
-                continue
-            seen_c.add(k)
-            cleaned.append({"rank": len(cleaned) + 1, "term": t, "category": "", "variants": [], "evidence": ent.get("evidence", [])})
-            if len(cleaned) >= 25:
-                break
+    missing = dedupe_list(missing, limit=10)
+    weak = dedupe_list(weak, limit=10)
 
-        if cleaned:
-            obj["keywords"] = cleaned
-            obj["missing"] = []
-            obj["weak"] = []
-            obj["summary"] = "Fallback deterministic JD line-by-line extraction used to derive explicit JD tokens."
-            obj["_raw_json"] = raw
-            obj["_filtered_out"] = obj.get("_filtered_out", [])
+    # final result
+    result = {
+        "keywords": final_kw,
+        "missing": missing,
+        "weak": weak,
+        "summary": f"Extracted {len(final_kw)} keywords; deterministic ranking applied.",
+        "_raw_json": candidate_block,
+        "_filtered_out": filtered_out
+    }
 
-    # Keep compatibility enforcement (original behavior)
-    obj = enforce_jd_keywords(obj, jd_text, resume_text)
+    print("\n=== FINAL KEYWORDS OBJECT (returned to caller) ===")
+    try:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception:
+        print(repr(result))
+    print("=================================================\n")
 
-    # Ensure lists are present
-    if not isinstance(obj.get("keywords"), list):
-        obj["keywords"] = []
-    if not isinstance(obj.get("missing"), list):
-        obj["missing"] = []
-    if not isinstance(obj.get("weak"), list):
-        obj["weak"] = []
+    # normalize keywords list defensively before returning
+    result["keywords"] = _normalize_keyword_list(result.get("keywords", []))
+    # also ensure _filtered_out entries are normalized (optional)
+    if "_filtered_out" in result:
+        result["_filtered_out"] = _normalize_keyword_list(result.get("_filtered_out", []))
 
-    return obj
-
+    return result
 
 
 
 def enforce_jd_keywords(obj, jd_text: str, resume_text: str):
     """
-    Compute true Gaps = JD/Top Keywords not present in resume
+    Compute presence/coverage info for extracted keywords vs resume.
+
+    Mutates/returns `obj` with added keys:
+      - obj["present"]  : list of keyword terms (strings) found in resume
+      - obj["missing"]  : list of keyword terms not found in resume
+      - obj["coverage"] : float percentage (0-100) of keywords present
+      - obj["present_map"]: optional mapping term -> match_rule for debugging (exact|compact|tokens|variant|evidence)
+    Matching rules mirror tokenization used across pipeline:
+      - sequential token match
+      - compact match (concatenated tokens)
+      - all tokens present (for multi-word)
+      - singular/plural heuristic for single-token words
     """
-    jd_terms = list(set(re.findall(r"\b[A-Z][A-Za-z0-9\+\-_/]{2,}\b", jd_text)))
+    # normalize incoming keywords list
+    if isinstance(obj, dict):
+        obj["keywords"] = _normalize_keyword_list(obj.get("keywords", []))
+    else:
+        obj = {"keywords": _normalize_keyword_list(obj)}
 
-    all_kw = []
-    for item in obj.get("keywords", []):
-        if item.get("term"):
-            all_kw.append(item["term"])
-        all_kw.extend(item.get("variants", []))
+    if not isinstance(obj, dict):
+        return obj
 
-    def _tok_seq(s: str): return [t.lower() for t in re.findall(r"[A-Za-z0-9#+.]+", s or "")]
+    keywords = obj.get("keywords") or []
+
+    # tokenization regex should match the one used elsewhere in the file
+    token_re = re.compile(r"[A-Za-z0-9#+.]+")
+    def _tok_seq(s: str):
+        return [t.lower() for t in token_re.findall(s or "")]
+
+    # prepare resume tokens & compact representation
     resume_tokens = _tok_seq(resume_text or "")
     resume_compact = "".join(resume_tokens)
+    resume_set = set(resume_tokens)
 
-    def _present(term: str) -> bool:
-        kt = _tok_seq(term)
-        if not kt: return False
-        L = len(kt)
-        for i in range(0, len(resume_tokens) - L + 1):
-            if resume_tokens[i:i+L] == kt:
-                return True
-        if "".join(kt) in resume_compact:
-            return True
-        if L == 1 and len(kt[0]) > 3:
-            base = kt[0]; alt = base[:-1] if base.endswith("s") else base + "s"
-            if base in resume_tokens or alt in resume_tokens:
-                return True
+    def _sequential_present(seq_tokens: List[str]) -> bool:
+        L = len(seq_tokens)
+        if L == 0:
+            return False
+        if L <= len(resume_tokens):
+            for i in range(0, len(resume_tokens) - L + 1):
+                if resume_tokens[i:i+L] == seq_tokens:
+                    return True
         return False
 
+    def _compact_present(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        return "".join(seq_tokens) in resume_compact
+
+    def _all_tokens_present(seq_tokens: List[str]) -> bool:
+        if not seq_tokens:
+            return False
+        return all(tok in resume_set for tok in seq_tokens)
+
+    def _single_token_plural_heuristic(tok: str) -> bool:
+        if not tok or len(tok) <= 3:
+            return False
+        base = tok
+        alt = base[:-1] if base.endswith("s") else base + "s"
+        return base in resume_set or alt in resume_set
+
+    def _present_by_rules(seq_tokens: List[str]) -> (bool, str):
+        """Return (found, rule_name)"""
+        if not seq_tokens:
+            return False, ""
+        if _sequential_present(seq_tokens):
+            return True, "sequential"
+        if _compact_present(seq_tokens):
+            return True, "compact"
+        if len(seq_tokens) > 1 and _all_tokens_present(seq_tokens):
+            return True, "all_tokens"
+        if len(seq_tokens) == 1 and _single_token_plural_heuristic(seq_tokens[0]):
+            return True, "singular_plural"
+        return False, ""
+
+    present = []
+    missing = []
+    present_map = {}
+
+    # For each keyword, attempt matches against term, variants, and evidence lines
+    for kw in keywords:
+        term = (kw.get("term") or "").strip()
+        variants = [v for v in (kw.get("variants") or []) if v and v.strip()]
+        evidence = kw.get("evidence") or []
+
+        found = False
+        found_rule = ""
+
+        # 1) check main term
+        if term:
+            seq = _tok_seq(term)
+            ok, rule = _present_by_rules(seq)
+            if ok:
+                found = True
+                found_rule = f"term:{rule}"
+
+        # 2) check variants if not found
+        if not found:
+            for v in variants:
+                seqv = _tok_seq(v)
+                ok, rule = _present_by_rules(seqv)
+                if ok:
+                    found = True
+                    found_rule = f"variant:{rule}"
+                    break
+
+        # 3) check evidence lines (if LLM supplied lines from JD) - see if tokens from evidence are present in resume
+        if not found and isinstance(evidence, list) and evidence:
+            for e in evidence:
+                seqe = _tok_seq(e)
+                ok, rule = _present_by_rules(seqe)
+                if ok:
+                    found = True
+                    found_rule = f"evidence:{rule}"
+                    break
+
+        # 4) fallback: if term empty but variants exist, mark missing/skip
+        display_term = term if term else (variants[0] if variants else "")
+
+        if found:
+            present.append(display_term)
+            present_map[display_term] = found_rule
+        else:
+            missing.append(display_term)
+            present_map[display_term] = "not_found"
+
+    total = max(1, len(keywords))
+    coverage = round((len(present) / total) * 100.0, 1)
+
+    # Attach computed fields to object (do not clobber existing missing if present? we overwrite with computed result)
+    obj["present"] = [p for p in present if p]
+    obj["missing"] = [m for m in missing if m]
+    obj["coverage"] = coverage
+    obj["present_map"] = present_map
 
     return obj
+
 
 # -----------------------------
 # Gaps (compare Top Keywords vs Resume)
@@ -626,6 +840,12 @@ def extract_gaps(resume_text: str, kw_obj: Dict[str, Any]) -> List[str]:
     - Return only those candidates that are NOT present in resume (token-level/compact checks).
     - Ignore tiny tokens and a small stoplist.
     """
+    # normalize kw_obj keywords to stable dict list
+    if isinstance(kw_obj, dict):
+        kw_obj["keywords"] = _normalize_keyword_list(kw_obj.get("keywords", []))
+    else:
+        kw_obj = {"keywords": _normalize_keyword_list(kw_obj)}
+
     if not kw_obj or not isinstance(kw_obj.get("keywords"), list) or len(kw_obj.get("keywords")) == 0:
         return []
 
@@ -1673,6 +1893,9 @@ def extract_ats_llm_from_optimizer(resume_text: str, optimizer_obj: Dict[str, An
                                    temperature: float, max_tokens: int, keys: Dict[str, str],
                                    jd_text: Optional[str] = "") -> Dict[str, Any]:
     provider = _provider_from_keys(provider_pref, keys)
+    # 🔹 normalize optimizer_obj keywords to be safe
+    optimizer_obj = optimizer_obj or {}
+    optimizer_obj["keywords"] = _normalize_keyword_list(optimizer_obj.get("keywords", []))
 
     kws = []
     for item in (optimizer_obj.get("keywords") or []):

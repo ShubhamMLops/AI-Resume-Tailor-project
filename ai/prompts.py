@@ -83,75 +83,85 @@ Return the literal JSON null only. Do not return any prose.
 
 
 SYSTEM_KEYWORDS = """
-STRICT JSON START/END MANDATE
+STRICT JSON-ONLY OUTPUT (MANDATORY)
 - Begin your response with '{' and end with '}' — nothing before or after.
-- Return EXACTLY one JSON object. Use double quotes. No trailing commas.
-- If you cannot extract any keywords, return exactly: {"keywords": [], "missing": [], "weak": [], "summary": ""}.
+- Return EXACTLY one JSON object using double quotes. No trailing commas, no markdown fences.
+- If you cannot extract any keywords, return exactly:
+  {"keywords": [], "missing": [], "weak": [], "summary": "", "skipped_lines": []}
 
-MAIN GOAL
-- Use ONLY the exact keywords present verbatim in the JOB DESCRIPTION (JD).
-- Do NOT invent synonyms, expansions, inferred technologies, or related terms.
-- Resume may only be used to label 'weak' or 'missing' for JD terms; resume must NOT add new keywords.
+PRINCIPLE (ZERO INVENTION)
+- Use ONLY phrases that appear verbatim in the JOB DESCRIPTION (JD).
+- Do NOT invent synonyms, inferred technologies, or expansions.
+- Resume is used only to judge whether a JD term is PRESENT, WEAK, or MISSING — resume must NOT add new keywords.
 
-MANDATORY EVIDENCE RULE
-- Every keyword object MUST include an "evidence" array listing the exact JD line(s) (verbatim) where that keyword appears.
-- Do NOT include any keyword without at least one evidence line.
-- Variants are allowed only if the variant string appears verbatim in the JD; each variant must also have JD evidence.
-
-PROCESS (MUST FOLLOW)
-1. Read the JD line-by-line.
-2. For each non-empty JD line, extract explicit technical tokens that appear verbatim in the line (tools, platforms, services, frameworks, languages, libraries, methodologies, modules, components, networking terms, processes, certifications, acronyms).
-3. For each extracted token:
-   - `term`: use the exact JD phrase (verbatim).
-   - `variants`: include exact JD acronyms/short-forms if they appear verbatim in the JD.
-   - `evidence`: include the exact JD line(s) (verbatim) showing the term.
-   - `category`: assign one concise professional category (e.g., "Platform", "Programming Language", "Tooling", "Database", "Monitoring", "Network", "Methodology").
-   - `rank`: order by importance implied in the JD (frequency/required language).
-4. Do NOT drop or filter out explicit JD terms.
-5. Do NOT invent or expand subcomponents unless they are verbatim in the JD.
-
-OUTPUT SCHEMA (STRICT JSON)
-Return exactly one JSON object with keys:
+REQUIRED SCHEMA FOR EACH KEYWORD
+Each entry in "keywords" MUST be an object with these keys:
 {
-  "keywords": [
-    {
-      "rank": int,
-      "term": str, 
-      "category": str,
-      "variants": [str],
-      "evidence": [str]
-    }
-  ],
-  "missing": [str],
-  "weak": [str],
-  "summary": str
+  "rank": int,               // 1 = most important
+  "term": str,               // exact text verbatim from JD
+  "category": str,           // short label like "Tool", "Language", "Platform", or "" if unknown
+  "variants": [str],        // list of other strings that appear verbatim in JD (empty list if none)
+  "evidence": [str]         // array of exact JD line(s) (verbatim) where term appears (at least one)
 }
 
-DIAGNOSTIC (IF EMPTY)
-- If there are no keywords, return the exact empty object (see above) OR include an extra top-level "skipped_lines" array explaining which JD lines were scanned and why they produced no keywords. (Only use "skipped_lines" for diagnostics; do not invent terms there.)
+MANDATORY EVIDENCE RULE
+- Every returned keyword MUST include at least one element in "evidence" that exactly matches a trimmed JD line (verbatim).
+- If no JD line can be provided as evidence for a term, the term must NOT be included.
 
-STRICT RULES (RE-ITERATED)
-- Zero-invention: only JD-verbatim phrases allowed.
-- Preserve phrase ordering and exact wording from JD when possible.
+NOISE REMOVAL RULES
+- Remove headings, prose, verbs-only fragments, generic words (e.g., "requirements", "experience", "responsibilities"), and punctuation-only tokens.
+- Remove items that are not clearly technical terms or exact JD phrases.
+- Deduplicate similar strings (normalize whitespace/punctuation) and keep the exact JD wording for the kept item.
+
+RANKING RULES
+- Rank keywords by importance implied by the JD (frequency, phrasing like "required" vs "preferred", position near top or under "Core Competencies"/"Technical Skills").
+- Assign integer ranks starting at 1 (most important). No gaps in ranks.
+
+PROCESS (MUST FOLLOW)
+1) Read the full JD first to identify domain/context (DevOps, Backend, Data Science, etc.) — only for context; do NOT invent new terms.
+2) Scan JD line-by-line. For each non-empty line, extract exact technical tokens/phrases that appear verbatim.
+3) Validate each candidate: it must appear verbatim in the JD line(s) used as "evidence".
+4) Build the final "keywords" list from validated candidates only, deduped, ranked, and each with evidence.
+5) Populate top-level "missing" and "weak" as empty arrays here — downstream code will compute gaps via deterministic checks.
+6) Optionally include a small diagnostic array "skipped_lines" listing JD lines that contained only non-technical prose (useful for debugging).
+
+OUTPUT
+Return a single object:
+{
+  "keywords": [ {keyword objects...} ],
+  "missing": [],
+  "weak": [],
+  "summary": "one-line summary of what you extracted",
+  "skipped_lines": [ "JD line 1", ... ]   // optional, for diagnostics only
+}
+
+IMPORTANT
 - Use temperature=0.0 for this call.
-End of instructions.
+- Return JSON only. If you cannot comply, return the empty object exactly as specified above.
 """
 
 
 
 
-
-USER_KEYWORDS = """JOB DESCRIPTION:
+USER_KEYWORDS = """
+JOB DESCRIPTION (JD):
 {jd}
 
-RESUME:
+RESUME (for context only — DO NOT invent keywords from resume):
 {resume}
 
-TASK:
-1. Infer the IT role/domain.
-2. Extract 12–18 high-priority technical keywords.
-3. Categorize them correctly and include variants.
-4. Return JSON only (strict schema)."""
+INSTRUCTIONS:
+- Read the JD above.
+- Return up to {top_k} vocabulary items (JD-verbatim technical tokens/phrases) following the SYSTEM instructions.
+- Provide exact JD lines in "evidence" for each term.
+- If a term has alternative spellings or acronyms that also appear verbatim in the JD, put them in "variants". If none exist, use an empty list [].
+- Do NOT include any tokens like 'e.g.', 'Responsibilities', 'Experience', or other heading words as terms.
+- JSON only.
+
+Fields you must NOT omit for each keyword: "rank", "term", "category", "variants", "evidence".
+
+Return the JSON object only.
+"""
 
 
 # -----------------------------
