@@ -13,11 +13,27 @@ from ai.prompts import (
 )
 from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
+# Add this line among the other imports in pipeline.py
+from ai.llm_keyword_optimizer import jd_to_json, extract_ranked_and_gap_keywords
 
 # -----------------------------
 # Keyword object sanitizer (add right after imports)
 # -----------------------------
 from typing import Iterable
+
+
+def _first_json_block(text: str) -> Optional[str]:
+    if not text: return None
+    start = text.find('{')
+    if start == -1: return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{': depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
 
 # -----------------------------
 # Keyword normalization helper
@@ -330,18 +346,22 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                          provider_pref: Optional[str], model_name: Optional[str],
                          temperature: float, max_tokens: int, keys: Dict[str, str]) -> Dict[str, Any]:
     """
-    LLM-assisted extraction with strict deterministic validation, ranking, and gap detection.
-    Defensive: tolerant to malformed LLM outputs (missing 'term', missing 'evidence', etc.)
-    This version also:
-      - safely supplies top_k to the USER_KEYWORDS prompt when available
-      - guarantees 'raw' is always defined (prevents local-variable access errors)
+    LLM-driven extraction:
+      - Normalize JD via jd_to_json_via_llm()
+      - Ask LLM to propose keyword candidates (existing behavior)
+      - Ask LLM (strict JSON) to REVIEW the candidates: label accept/reject, provide category, optional stoplist, domain
+      - Trust LLM review to remove noise (no hardcoded stoplists or domain mapping)
+      - Conservative deterministic fallback if LLM fails
+    Returns: {"keywords": [...], "missing": [], "weak": [], "summary": "", "_raw_json": "...", "_filtered_out": [...]}
     """
     provider = _provider_from_keys(provider_pref, keys or {})
-    # 1) Normalize JD via jd_to_json_via_llm for stable line/evidence handling
+
+    # 1) Normalize JD via LLM (fallback inside jd_to_json_via_llm)
     _jd_json = jd_to_json_via_llm(jd_text, provider, model_name, temperature=0.0, max_tokens=800)
-    jd_flat = _jd_json.get("flat", jd_text or "")
+    jd_flat = _jd_json.get("flat", jd_text or "") or ""
     jd_lines = [ln.get("text", "").strip() for ln in (_jd_json.get("lines") or []) if ln.get("text")]
-    total_jd_lines = max(1, len(jd_lines))
+    jd_lines_trimmed = [l for l in jd_lines]
+    total_jd_lines = max(1, len(jd_lines_trimmed))
 
     print("\n=== NORMALIZED JD JSON (used for extraction) ===")
     try:
@@ -350,39 +370,40 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         print(repr(_jd_json))
     print("==============================================\n")
 
-    if not jd_flat or not jd_flat.strip():
+    if not jd_flat.strip():
         return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": "", "_filtered_out": []}
 
-    # decide top_k for extraction (tuneable)
+    # decide top_k for extraction
     top_k = 60 if (max_tokens is None or max_tokens >= 60) else max(10, int(max(10, max_tokens // 10)))
 
-    # 2) Ask LLM for candidate verbatim keywords (JSON-only)
+    # 2) Ask LLM for candidate verbatim keywords (JSON-only) - same as before
     from ai.prompts import SYSTEM_KEYWORDS, USER_KEYWORDS
-    # build user_payload robustly: try to provide top_k if the prompt includes it,
-    # otherwise fall back to the two-arg format (jd/resume).
     try:
         user_payload = USER_KEYWORDS.format(jd=jd_flat, resume=(resume_text or ""), top_k=top_k)
     except Exception:
         user_payload = USER_KEYWORDS.format(jd=jd_flat, resume=(resume_text or ""))
-
-    raw = ""  # Defensive init so 'raw' always exists
+    raw = ""
     try:
         raw = provider.chat(model=model_name, system=SYSTEM_KEYWORDS, user=user_payload, temperature=0.0, max_tokens=max_tokens or 800) or ""
         if not isinstance(raw, str):
             raw = str(raw or "")
     except Exception as e:
-        # Log and continue to deterministic fallback below
-        print("Warning: provider.chat failed in extract_keywords_llm:", repr(e))
+        print("Warning: provider.chat failed in extract_keywords_llm (initial candidates):", repr(e))
         raw = ""
 
     raw = (raw or "").strip()
-    # clean fences/prefixes
     if raw.lower().startswith("json"):
         raw = raw[4:].strip()
     if raw.startswith("```") and raw.endswith("```"):
         raw = raw.strip("`").strip()
 
-    # extract first JSON block safely
+    print("\n=== RAW LLM RESPONSE (candidate block truncated) ===")
+    try:
+        print(raw[:4000])
+    except Exception:
+        print(repr(raw))
+    print("=== END RAW LLM RESPONSE ===\n")
+
     candidate_block = _first_json_block(raw) or raw or "{}"
     candidate_block = re.sub(r",\s*(\]|\})", r"\1", candidate_block)
     candidate_block = candidate_block.replace("“", '"').replace("”", '"').replace("’", "'")
@@ -391,218 +412,210 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         cand_obj = json.loads(candidate_block)
     except Exception:
         cand_obj = {"keywords": []}
-    # Ensure cand_obj is a dict
     if not isinstance(cand_obj, dict):
         cand_obj = {"keywords": []}
 
-    # Normalize candidate list
     cand_list = cand_obj.get("keywords") if isinstance(cand_obj.get("keywords"), list) else []
     normalized_candidates = []
     for c in cand_list:
         if not isinstance(c, dict):
-            # If candidate is a string entry, convert to dict
             if isinstance(c, str) and c.strip():
-                normalized_candidates.append({"term": c.strip(), "variants": [], "evidence": [], "category": ""})
+                normalized_candidates.append({"term": c.strip(), "variants": [], "evidence": [] , "category": ""})
             continue
         term = (c.get("term") or "").strip() if c.get("term") is not None else ""
         if not term:
-            # skip malformed entry; keep debug
             continue
         ev = [e for e in (c.get("evidence") or []) if isinstance(e, str) and e.strip()]
         variants = [v for v in (c.get("variants") or []) if v and isinstance(v, str) and v.strip()]
         category = (c.get("category") or "") if isinstance(c.get("category", ""), str) else ""
         normalized_candidates.append({"term": term, "variants": variants, "evidence": ev, "category": category})
 
-    # Deterministic matching helpers (same rules as SYSTEM prompt)
-    token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    jd_tokens = [t.lower() for t in token_re.findall(jd_flat or "")]
-    jd_compact = "".join(jd_tokens)
-    jd_token_set = set(jd_tokens)
-    jd_lines_trimmed = [l.strip() for l in jd_lines]
+    # If no candidates at all, prepare to do deterministic fallback later
+    # 3) ASK THE LLM TO REVIEW & FILTER the candidates (JSON-only). This is the key change:
+    #    We let the LLM return: { "domain": "...", "stoplist": [...], "review":[ {"term":"..","accept":true/false,"category":"Tool|Lang|Other","reason":""}, ... ] }
+    review_prompt_system = (
+        "You are a strict JSON-only reviewer for keyword extraction. "
+        "INPUT: a job description (lines) and a list of candidate keyword objects the first LLM produced. "
+        "TASK (MANDATORY JSON OUTPUT): For each candidate, decide whether it is a valid technical/keyword item to keep (accept) or should be discarded as noise (reject). "
+        "Also return an optional 'stoplist' (short list of obvious noisy tokens you would drop globally) and a single domain label inferred from the JD. "
+        "OUTPUT SCHEMA (JSON only): "
+        "{\"domain\": \"<short domain label>\", \"stoplist\": [\"tok1\",\"tok2\"], \"review\": [ {\"term\":\"...\",\"accept\": true|false, \"category\":\"Tool|Language|Platform|Database|Concept|Responsibility|Other\", \"variants\": [\"...\"], \"reason\": \"(if rejected brief reason)\"}, ... ] } "
+        "REQUIREMENTS: "
+        "- Use ONLY tokens/phrases that appear verbatim in the JD (do not invent synonyms). "
+        "- If a candidate is duplicate/substring noise, mark accept=false and explain briefly in 'reason'. "
+        "- Keep entries concise (single-term or short technical phrase). "
+        "- If uncertain, prefer reject (minimize noise). "
+        "- Temperature=0 behavior: deterministic, JSON only. "
+        "Return valid JSON only matching the schema above. "
+    )
 
-    def tok_seq(s: str):
-        return [t.lower() for t in token_re.findall(s or "")]
+    # Build payload to send to reviewer LLM
+    review_input = {
+        "jd_lines": jd_lines_trimmed,
+        "candidates": normalized_candidates
+    }
 
-    def sequential_match(seq_tokens: List[str], hay_tokens=jd_tokens) -> bool:
-        if not seq_tokens:
+    review_user = json.dumps(review_input, ensure_ascii=False, indent=2)
+    review_raw = ""
+    try:
+        review_raw = provider.chat(model=model_name, system=review_prompt_system, user=review_user, temperature=0.0, max_tokens=800) or ""
+        if not isinstance(review_raw, str):
+            review_raw = str(review_raw or "")
+    except Exception as e:
+        print("Warning: provider.chat failed in extract_keywords_llm (review step):", repr(e))
+        review_raw = ""
+
+    review_raw = (review_raw or "").strip()
+    if review_raw.startswith("```") and review_raw.endswith("```"):
+        review_raw = review_raw.strip("`").strip()
+
+    # extract first JSON block
+    review_block = _first_json_block(review_raw) or review_raw or "{}"
+    review_block = review_block.replace("“", '"').replace("”", '"').replace("’", "'")
+    try:
+        review_obj = json.loads(review_block)
+    except Exception:
+        review_obj = {}
+
+    # Interpret review_obj: build accept/reject lists according to LLM review
+    accepted_terms_by_llm = set()
+    rejected_terms_info = []
+    lll_domain = (review_obj.get("domain") or "").strip() if isinstance(review_obj, dict) else ""
+    lll_stoplist = review_obj.get("stoplist") if isinstance(review_obj.get("stoplist"), list) else []
+
+    if isinstance(review_obj.get("review"), list):
+        for r in review_obj.get("review"):
+            if not isinstance(r, dict):
+                continue
+            term = (r.get("term") or "").strip()
+            if not term:
+                continue
+            if r.get("accept"):
+                accepted_terms_by_llm.add(term)
+            else:
+                rejected_terms_info.append({"term": term, "reason": r.get("reason","llm_reject")})
+
+    # 4) Now perform conservative validation + trust LLM accept decisions.
+    #    Accept candidate only if: LLM accepted it AND it's present verbatim in JD lines (or in candidate evidence)
+    def term_in_jd_lines(term: str) -> bool:
+        if not term:
             return False
-        L = len(seq_tokens)
-        if L == 0:
-            return False
-        for i in range(0, len(hay_tokens) - L + 1):
-            if hay_tokens[i:i+L] == seq_tokens:
+        for ln in jd_lines_trimmed:
+            if term in ln:
                 return True
         return False
 
-    def all_tokens_present(seq_tokens: List[str]) -> bool:
-        if not seq_tokens:
-            return False
-        return all(tok in jd_token_set for tok in seq_tokens)
-
-    def compact_match(seq_tokens: List[str]) -> bool:
-        if not seq_tokens:
-            return False
-        return "".join(seq_tokens) in jd_compact
-
-    def present_in_jd_strict(seq_tokens: List[str]) -> bool:
-        if not seq_tokens:
-            return False
-        if len(seq_tokens) == 1:
-            return sequential_match(seq_tokens) or compact_match(seq_tokens)
-        if sequential_match(seq_tokens):
-            return True
-        if all_tokens_present(seq_tokens):
-            return True
-        if compact_match(seq_tokens):
-            return True
-        return False
-
-    # Validate LLM candidates: evidence must include at least one exact JD line and term must be justifiable
     validated = []
     filtered_out = []
+
     for c in normalized_candidates:
-        term = c.get("term", "").strip()
+        term = c.get("term","").strip()
         if not term:
             continue
-        variants = c.get("variants", []) or []
-        evidence = c.get("evidence", []) or []
-
-        # evidence must match at least one JD line exactly (trimmed)
-        evidence_ok = False
-        matched_line_indexes = []
-        jd_lines_set = set(jd_lines_trimmed)
-        for ev in evidence:
-            if not isinstance(ev, str):
+        # If LLM provided review decisions, require it to have accepted
+        if review_obj and isinstance(review_obj.get("review"), list):
+            if term not in accepted_terms_by_llm:
+                # try to capture rejection reason if present
+                reason = next((r["reason"] for r in rejected_terms_info if r.get("term")==term), "rejected_by_llm")
+                filtered_out.append({"term": term, "variants": c.get("variants",[]), "reason": reason})
                 continue
-            ev_trim = ev.strip()
-            if ev_trim in jd_lines_set:
+        # Additional conservative check: ensure term appears somewhere in JD lines OR was supplied as evidence by initial LLM
+        evidence_ok = False
+        for ev in (c.get("evidence") or []):
+            if ev and ev.strip() in jd_lines_trimmed:
                 evidence_ok = True
-                for idx, jdln in enumerate(jd_lines_trimmed):
-                    if ev_trim == jdln:
-                        matched_line_indexes.append(idx)
-                        break
-
-        # If evidence missing or didn't match any JD line, attempt to discover exact jd lines that contain the term verbatim
+                break
+        if not evidence_ok and not term_in_jd_lines(term):
+            # if LLM accepted but we cannot find term in JD lines, still allow if variant is present OR evidence non-empty
+            if any(v for v in (c.get("variants") or []) if term_in_jd_lines(v)):
+                evidence_ok = True
         if not evidence_ok:
-            for idx, jdln in enumerate(jd_lines_trimmed):
-                if term in jdln:
-                    evidence_ok = True
-                    matched_line_indexes.append(idx)
+            filtered_out.append({"term": term, "variants": c.get("variants",[]), "reason": "no_exact_jd_evidence"})
+            continue
+        # Passed gates -> accept
+        # Normalize evidence: include jd lines that contain term
+        evs = [ln for ln in jd_lines_trimmed if term in ln]
+        if not evs:
+            evs = c.get("evidence") or []
+        validated.append({"term": term, "variants": c.get("variants",[]), "evidence": evs, "category": c.get("category","") or ""})
 
-        # token justification
-        term_seq = tok_seq(term)
-        term_found = present_in_jd_strict(term_seq)
-
-        # Accept only if evidence_ok AND term_found
-        if evidence_ok and term_found:
-            # normalize evidence: include unique exact jd lines where term appears
-            evs = []
-            for i in sorted(set(matched_line_indexes)):
-                if 0 <= i < len(jd_lines_trimmed):
-                    evs.append(jd_lines_trimmed[i])
-            if not evs:
-                # as a final attempt, include any JD lines that contain the term
-                for jdln in jd_lines_trimmed:
-                    if term in jdln:
-                        evs.append(jdln)
-            validated.append({"term": term, "variants": variants, "evidence": evs, "category": c.get("category","") or ""})
-        else:
-            filtered_out.append({"term": term, "variants": variants, "reason": "evidence_or_justification_failed"})
-
-    # If LLM returned nothing valid, run conservative deterministic fallback
+    # 5) If LLM review returned empty or nothing accepted, fall back to a conservative deterministic augmentation
     if not validated:
+        # deterministic extraction: extract parenthetical lists and tokens >=2 chars that appear in JD tokens
+        token_re_local = re.compile(r"[A-Za-z0-9\+#\-/\.]{2,}")
         seen = set()
         fallback = []
-        token_re_local = re.compile(r"[A-Za-z0-9\+#\-/\.]{2,}")
-        for idx, line in enumerate(jd_lines_trimmed):
+        for line in jd_lines_trimmed:
             if not line:
                 continue
-            # 1) parenthetical content
+            # parentheticals first
             for par in re.findall(r"\(([^)]+)\)", line):
-                parts = [p.strip() for p in re.split(r",|\u2022|;|\band\b|\bor\b", par) if p.strip()]
+                parts = [p.strip() for p in re.split(r",|;|\band\b|\bor\b", par) if p.strip()]
                 for p in parts:
-                    if len(p) < 2:
-                        continue
                     key = re.sub(r"[^A-Za-z0-9]+"," ", p).strip().lower()
                     if not key or key in seen:
                         continue
                     seen.add(key)
                     fallback.append({"term": p, "variants": [], "evidence": [line], "category": ""})
-            # 2) slash-like tokens and explicit tokens
+            # token-wise
             for m in token_re_local.finditer(line):
                 cand = m.group(0).strip().strip(",:;.-")
-                if len(cand) < 2:
-                    continue
                 key = re.sub(r"[^A-Za-z0-9]+"," ", cand).strip().lower()
                 if not key or key in seen:
                     continue
                 seen.add(key)
                 fallback.append({"term": cand, "variants": [], "evidence": [line], "category": ""})
-            # 3) comma-separated short fragments
-            parts = [p.strip() for p in re.split(r",|\u2022|;|\band\b|\bor\b", line) if p.strip()]
-            for p in parts:
-                words = token_re_local.findall(p)
-                if 0 < len(words) <= 4:
-                    cand = " ".join(words)
-                    key = re.sub(r"[^A-Za-z0-9]+"," ", cand).strip().lower()
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    fallback.append({"term": cand, "variants": [], "evidence": [line], "category": ""})
-        # cap fallback
+        # keep short fallback
         validated = fallback[:80]
 
-    # Now compute deterministic ranking for validated list
+    # Deterministic ranking (frequency + early position)
     ranked = []
+    token_re = re.compile(r"[A-Za-z0-9#+.]+")
+    jd_tokens = [t.lower() for t in token_re.findall(jd_flat or "")]
+    jd_compact = "".join(jd_tokens)
+    def tok_seq(s: str):
+        return [t.lower() for t in token_re.findall(s or "")]
+
     for item in validated:
         term = (item.get("term") or "").strip()
         if not term:
             continue
-        ev_lines = item.get("evidence", []) or []
-        # frequency = distinct JD lines where term appears
-        freq_set = set()
-        for idx, jdln in enumerate(jd_lines_trimmed):
-            if term in jdln:
-                freq_set.add(idx)
-        frequency = len(freq_set) if freq_set else max(1, len(ev_lines) or 1)
-        # heuristics
-        required_bonus = 0
-        preferred_bonus = 0
+        ev_lines_idx = set()
+        for idx, ln in enumerate(jd_lines_trimmed):
+            if term in ln:
+                ev_lines_idx.add(idx)
+        frequency = len(ev_lines_idx) if ev_lines_idx else max(1, len(item.get("evidence",[]) or [1]))
+        earliest_idx = min(ev_lines_idx) if ev_lines_idx else (total_jd_lines + 1)
         heading_boost = 0
-        earliest_idx = min(list(freq_set)) if freq_set else (total_jd_lines + 1)
-        for idx in list(freq_set):
-            ln = jd_lines_trimmed[idx].lower()
-            if any(x in ln for x in ("required", "must", "essential", "responsible for")):
-                required_bonus = 1
-            if any(x in ln for x in ("preferred", "nice to have", "optional")):
-                preferred_bonus = 1
+        for idx in ev_lines_idx:
             for back in range(max(0, idx-2), idx):
-                hdr = jd_lines_trimmed[back].strip()
-                if re.match(r"(?i)^(core\s*competenc(?:ies|y)|technical\s*skills|skills|expertise)\s*[:\-–—]?$", hdr):
+                hdr = jd_lines_trimmed[back].strip().lower()
+                if hdr.endswith(":") or hdr in ("responsibilities", "requirements"):
                     heading_boost = 1
                     break
-        early_pos_bonus = 1 if earliest_idx < max(1, int((0.1 * total_jd_lines))) else 0
-        score = 3 * frequency + 5 * required_bonus + 1 * preferred_bonus + 2 * early_pos_bonus + 2 * heading_boost
+        early_pos_bonus = 1 if earliest_idx < max(1, int(0.1 * total_jd_lines)) else 0
+        score = 3 * frequency + 2 * heading_boost + early_pos_bonus
         ranked.append({"term": term, "variants": item.get("variants",[]), "evidence": item.get("evidence",[]), "category": item.get("category","") or "Other", "score": score, "earliest_idx": earliest_idx})
 
-    # Sort by score desc, tie-break earliest_idx asc
-    ranked.sort(key=lambda x: (-x.get("score", 0), x.get("earliest_idx", total_jd_lines + 1)))
+    ranked.sort(key=lambda x: (-x.get("score",0), x.get("earliest_idx", total_jd_lines + 1)))
 
-    # Build final keywords list with ranks and normalized fields
+    # Build final list, dedupe, and add ranks
     final_kw = []
     seen_terms = set()
-    for i, ent in enumerate(ranked, start=1):
+    rank_counter = 1
+    for ent in ranked:
         t = (ent.get("term") or "").strip()
         if not t:
             continue
-        key = re.sub(r"[^A-Za-z0-9]+", " ", t).strip().lower()
+        key = re.sub(r"[^A-Za-z0-9]+"," ", t).strip().lower()
         if not key or key in seen_terms:
             continue
         seen_terms.add(key)
-        variants = [v for v in (ent.get("variants") or []) if v and isinstance(v, str) and v.strip()]
-        evidence = [e for e in (ent.get("evidence") or []) if isinstance(e, str) and e.strip()]
+        variants = [v for v in (ent.get("variants") or []) if isinstance(v,str) and v.strip()]
+        evidence = [e for e in (ent.get("evidence") or []) if isinstance(e,str) and e.strip()]
         category = ent.get("category") or "Other"
-        final_kw.append({"rank": i, "term": t, "category": category, "variants": variants, "evidence": evidence})
+        final_kw.append({"rank": rank_counter, "term": t, "category": category, "variants": variants, "evidence": evidence})
+        rank_counter += 1
 
     # Build missing/weak lists by comparing to resume deterministically
     res_token_re = re.compile(r"[A-Za-z0-9#+.]+")
@@ -613,8 +626,6 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         if not seq_tokens:
             return False
         L = len(seq_tokens)
-        if L == 0:
-            return False
         for i in range(0, len(resume_tokens) - L + 1):
             if resume_tokens[i:i+L] == seq_tokens:
                 return True
@@ -626,13 +637,6 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
                 return True
         return False
 
-    def compact_only_in_resume(seq_tokens: List[str]) -> bool:
-        if not seq_tokens:
-            return False
-        if present_in_resume_strict(seq_tokens):
-            return False
-        return "".join(seq_tokens) in resume_compact
-
     missing = []
     weak = []
     top_candidates = final_kw[:60]
@@ -641,7 +645,7 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
         if not seq:
             continue
         if not present_in_resume_strict(seq):
-            if compact_only_in_resume(seq):
+            if "".join(seq) in resume_compact:
                 weak.append(ent["term"])
             else:
                 missing.append(ent["term"])
@@ -649,7 +653,7 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     def dedupe_list(arr, limit=None):
         out=[]; seen=set()
         for x in arr:
-            if not isinstance(x, str):
+            if not isinstance(x,str):
                 continue
             k = x.strip().lower()
             if not k or k in seen:
@@ -662,15 +666,21 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     missing = dedupe_list(missing, limit=10)
     weak = dedupe_list(weak, limit=10)
 
-    # final result
     result = {
         "keywords": final_kw,
         "missing": missing,
         "weak": weak,
-        "summary": f"Extracted {len(final_kw)} keywords; deterministic ranking applied.",
+        "summary": f"Extracted {len(final_kw)} keywords; LLM-reviewed filtering applied.",
         "_raw_json": candidate_block,
         "_filtered_out": filtered_out
     }
+
+    # Defensive normalization and debug shaping
+    result["keywords"] = _normalize_keyword_list(result.get("keywords", []))
+    try:
+        result["_filtered_out"] = [{"term": f.get("term") if isinstance(f,dict) else str(f), "reason": f.get("reason","")} for f in (result.get("_filtered_out") or [])]
+    except Exception:
+        pass
 
     print("\n=== FINAL KEYWORDS OBJECT (returned to caller) ===")
     try:
@@ -678,12 +688,6 @@ def extract_keywords_llm(resume_text: str, jd_text: str,
     except Exception:
         print(repr(result))
     print("=================================================\n")
-
-    # normalize keywords list defensively before returning
-    result["keywords"] = _normalize_keyword_list(result.get("keywords", []))
-    # also ensure _filtered_out entries are normalized (optional)
-    if "_filtered_out" in result:
-        result["_filtered_out"] = _normalize_keyword_list(result.get("_filtered_out", []))
 
     return result
 

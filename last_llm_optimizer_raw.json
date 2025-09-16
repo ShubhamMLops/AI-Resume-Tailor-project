@@ -1,0 +1,56 @@
+json
+{
+  "domain": "DevOps",
+  "candidates": [
+    {
+      "term": "CI/CD Pipeline Development",
+      "accept": true,
+      "category": "Responsibility"
+    },
+    {
+      "term": "Automate build",
+      "accept": true,
+      "category": "Responsibility"
+    },
+    {
+      "term": "Infrastructure Management",
+      "accept": true,
+      "category": "Responsibility"
+    },
+    {
+      "term": "CloudFormation",
+      "accept": true,
+      "category": "Tool"
+    },
+    {
+      "term": "Ansible",
+      "accept": true,
+      "category": "Tool"
+    },
+    {
+      "term": "high availability and disaster recovery capabilities",
+      "accept": true,
+      "category": "Concept"
+    },
+    {
+      "term": "Monitoring and Performance",
+      "accept": true,
+      "category": "Responsibility"
+    },
+    {
+      "term": "Prometheus",
+      "accept": true,
+      "category": "Tool"
+    },
+    {
+      "term": "Grafana",
+      "accept": true,
+      "category": "Tool"
+    },
+    {
+      "term": "ELK Stack",
+      "accept": true,
+      "category": "Tool"
+    }
+  ]
+}
