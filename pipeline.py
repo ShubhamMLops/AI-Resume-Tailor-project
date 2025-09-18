@@ -15,9 +15,69 @@ from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
 # Add this line among the other imports in pipeline.py
 from ai.jd_keywords import extract_keywords_from_jd
-
 from pprint import pprint
 import textwrap
+# ---------- call_llm resolver ----------
+import importlib, sys, logging
+LAST_CANONICAL_GAPS: List[str] = []
+
+logger = logging.getLogger(__name__)
+
+def resolve_call_llm():
+    candidates = [
+        "ai.provider",   # try your exact path first
+        "ai.providers",
+        "providers",
+    ]
+    try:
+        if "." in __name__:
+            pkg = __name__.rsplit(".",1)[0]
+            candidates.extend([f"{pkg}.provider", f"{pkg}.providers"])
+    except Exception:
+        pass
+
+    if "providers" in sys.modules:
+        candidates.insert(0, "providers")
+
+    for name in [c for c in candidates if c]:
+        try:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "call_llm"):
+                fn = getattr(mod, "call_llm")
+                print(f"[resolve_call_llm] call_llm imported from '{name}'")
+                logger.info(f"call_llm imported from '{name}'")
+                return fn
+        except Exception as e:
+            logger.debug(f"[resolve_call_llm] import '{name}' failed: {e}")
+
+    for modname, mod in list(sys.modules.items()):
+        try:
+            if hasattr(mod, "call_llm"):
+                print(f"[resolve_call_llm] call_llm found in loaded module '{modname}'")
+                logger.info(f"call_llm found in loaded module '{modname}'")
+                return getattr(mod, "call_llm")
+        except Exception:
+            pass
+
+    print("[resolve_call_llm] call_llm not found; using local heuristic")
+    logger.warning("call_llm not found; fallback to heuristic")
+    return None
+
+# Optional early resolution
+GLOBAL_CALL_LLM = resolve_call_llm()
+# -------------------------------------------------
+def _normalize_incoming(keywords):
+    out = []
+    seen = set()
+    for t in (keywords or []):
+        if isinstance(t, dict):
+            s = (t.get("term") or t.get("keyword") or t.get("name") or "").strip()
+        else:
+            s = (t or "").strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    return out
 
 # -----------------------
 # Helper: remove resume placeholder headings
@@ -1482,355 +1542,329 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
 # -----------------------------
 # Generate Technical Skills (LLM) -> now returns structured Technical Skills (heading -> list)
 # -----------------------------
-def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: List[str],
-                               provider_pref: Optional[str], model_name: Optional[str],
-                               temperature: float, max_tokens: int, keys: Dict[str, str]) -> str:
+# Paste this into pipeline.py replacing the old generate_keyword_sentences
+# ---------- call_llm resolver + generate_keyword_sentences ----------
+import importlib
+import sys
+import re
+import json
+import logging
+from typing import List, Optional, Dict
+
+logger = logging.getLogger(__name__)
+
+def resolve_call_llm():
     """
-    Append-only merge of target_keywords into the resume's Technical Skills block.
-    - Preserve original Technical Skills lines verbatim.
-    - Append new keywords only (do not remove or alter existing items).
-    - If no heading matches a gap keyword, create a meaningful heading and add the keyword.
-    - Use provider only once (optional) to map remaining gaps -> headings; if provider fails, fallback to "Other Technical Skills".
+    Try multiple module names to find `call_llm`. Includes your path `ai.provider`.
+    Returns the function or None.
     """
+    candidates = [
+        "ai.provider",               # your stated location
+        "ai.providers",
+        "providers",
+    ]
+    # package-relative tries (if this module lives in a package)
     try:
-        # --- helpers ---
-        def _log(msg, *args):
-            try:
-                # concise console logging (replace with logger if available)
-                print("[generate_keyword_sentences]", msg % args if args else msg)
-            except Exception:
-                pass
+        if "." in __name__:
+            candidates.append(__name__.rsplit(".", 1)[0] + ".provider")
+            candidates.append(__name__.rsplit(".", 1)[0] + ".providers")
+    except Exception:
+        pass
 
-        def _safe_strip(s):
-            try:
-                return (s or "").strip()
-            except Exception:
-                return str(s or "")
+    # prefer already-loaded 'providers' if present
+    if "providers" in sys.modules:
+        candidates.insert(0, "providers")
 
-        def _is_short_skill(s: str) -> bool:
-            """Relaxed definition of a skill token."""
-            if not s or not s.strip():
-                return False
-            s = s.strip()
-            if re.fullmatch(r"[-•▪‣·\s]+", s):
-                return False
-            words = s.split()
-            if len(words) > 14:
-                return False
-            if re.search(r"\b(role|responsib|project|experience|since|from|to|with|present|manager|joined|company)\b", s, flags=re.I):
-                return False
-            return True
+    for name in [c for c in candidates if c]:
+        try:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "call_llm"):
+                fn = getattr(mod, "call_llm")
+                print(f"[resolve_call_llm] call_llm imported from '{name}'")
+                logger.info(f"call_llm imported from '{name}'")
+                return fn
+        except Exception as e:
+            # debug info, but keep trying others
+            print(f"[resolve_call_llm] import '{name}' failed: {e}")
 
-        def _split_line_to_parts(line: str):
-            return [p.strip() for p in re.split(r"[,\u2022\u2023\u2024\u2025/|;]+", (line or "")) if p and p.strip()]
+    # last attempt: scan already-loaded modules
+    for modname, mod in list(sys.modules.items()):
+        try:
+            if hasattr(mod, "call_llm"):
+                print(f"[resolve_call_llm] call_llm found in loaded module '{modname}'")
+                logger.info(f"call_llm found in loaded module '{modname}'")
+                return getattr(mod, "call_llm")
+        except Exception:
+            continue
 
-        # --- sanitize inputs ---
-        resume_text = resume_text or ""
-        jd_text = jd_text or ""
-        input_candidates = []
-        if isinstance(target_keywords, list):
-            for t in target_keywords:
-                if isinstance(t, str):
-                    if t.strip():
-                        input_candidates.append(t.strip())
-                elif isinstance(t, dict):
-                    # support dict items e.g. {"term":"Kubernetes"} or {"keyword":"Kubernetes"}
-                    term = t.get("term") or t.get("keyword") or t.get("name") or t.get("kw")
-                    if term and isinstance(term, str) and term.strip():
-                        input_candidates.append(term.strip())
-                    else:
-                        # if dict has single string-like value, try to find it
-                        for v in t.values():
-                            if isinstance(v, str) and v.strip():
-                                input_candidates.append(v.strip()); break
-                else:
-                    try:
-                        s = str(t).strip()
-                        if s:
-                            input_candidates.append(s)
-                    except Exception:
-                        pass
-        elif isinstance(target_keywords, dict):
-            # allow passing dict -> take keys or values
-            for k, v in target_keywords.items():
-                if isinstance(v, str) and v.strip():
-                    input_candidates.append(v.strip())
-                elif isinstance(k, str) and k.strip():
-                    input_candidates.append(k.strip())
-        elif isinstance(target_keywords, str):
-            if target_keywords.strip():
-                input_candidates = [target_keywords.strip()]
+    print("[resolve_call_llm] call_llm NOT found; will use local heuristic")
+    logger.warning("call_llm NOT found; falling back to local heuristic")
+    return None
 
-        # dedupe preserving order (case-insensitive)
-        seen_ck = set(); merged_candidates = []
-        for c in input_candidates:
-            key = c.strip().lower()
-            if key and key not in seen_ck:
-                seen_ck.add(key); merged_candidates.append(c.strip())
+# Resolve early (optional). generate_keyword_sentences will also call resolve_call_llm() at runtime.
+GLOBAL_CALL_LLM = resolve_call_llm()
+def _normalize_token(s: str) -> str:
+    """Lowercase, remove trivial wrapper words and punctuation for matching."""
+    if not s:
+        return ""
+    s = str(s).strip()
+    # remove common wrapper words that often appear in gaps
+    s = re.sub(r'^(using|with|experience\s+in|knowledge\s+of)\s+', '', s, flags=re.I)
+    # normalize separators
+    s = s.replace('-', ' ').replace('/', ' ').replace('_', ' ')
+    # remove punctuation except + (e.g., C++)
+    s = re.sub(r'[^\w\s\+]', '', s)
+    return " ".join(s.split()).lower()
 
-        _log("Incoming target keywords count: %d", len(merged_candidates))
+def _clean_keyword_for_insert(s: str) -> str:
+    """Make a human-friendly normalized insert: prefer 'GitHub Actions' instead of 'using GitHub Actions' etc."""
+    if not s:
+        return ""
+    s0 = s.strip()
+    # common fixes
+    s0 = re.sub(r'^(using|with)\s+', '', s0, flags=re.I)
+    s0 = s0.replace('Terraform/Ansible', 'Terraform, Ansible')
+    # normalize spacing and punctuation
+    s0 = re.sub(r'\s+', ' ', s0).strip()
+    # Title-case common product names selectively (keep acronyms)
+    # Minimal: preserve 'GitHub Actions' or 'GitHub' casing
+    if re.search(r'github', s0, flags=re.I):
+        if re.search(r'actions', s0, flags=re.I):
+            return "GitHub Actions"
+        return "GitHub"
+    if re.search(r'\bterraform\b', s0, flags=re.I):
+        return "Terraform"
+    if re.search(r'\bansible\b', s0, flags=re.I):
+        return "Ansible"
+    return s0
 
-        # --- extract original Technical Skills block verbatim ---
-        def _find_tech_block_lines(text: str):
-            lines = text.splitlines()
-            start = None; end = None
-            for i, ln in enumerate(lines):
-                if re.match(r"(?i)^(technical\s*skills|skills|core\s*competenc(?:y|ies)|core\s*skills|expertise|toolbox|technical\s*expertise)\s*[:\-–—]?\s*$", ln.strip()):
-                    start = i + 1
-                    # find block end
-                    for j in range(start, len(lines)):
-                        nxt = lines[j].strip()
-                        if not nxt:
-                            end = j; break
-                        if re.match(r"(?i)^(work\s*experience|experience|education|projects|certifications|awards|publications|professional\s*summary|profile\s*summary)\s*[:\-–—]?\s*$", nxt):
-                            end = j; break
-                    if end is None:
-                        end = len(lines)
-                    return [lines[k].rstrip() for k in range(start, end)]
-            return []
+def _dedupe_preserve_order(lst: List[str]) -> List[str]:
+    seen = set(); out = []
+    for x in lst:
+        if not x: continue
+        kl = x.strip().lower()
+        if kl not in seen:
+            seen.add(kl); out.append(x.strip())
+    return out
 
-        orig_block_lines = _find_tech_block_lines(resume_text)
-        _log("Found %d lines in original tech block.", len(orig_block_lines))
+def generate_keyword_sentences(resume_text: str,
+                               jd_text: str,
+                               target_keywords: List[str],
+                               provider_pref: Optional[str],
+                               model_name: Optional[str],
+                               temperature: float,
+                               max_tokens: int,
+                               keys: Dict[str, str]) -> str:
+    """
+    Simplified, human-readable Technical Skills generator:
+    - Extracts the Technical Skills block from resume_text (by heading).
+    - Computes canonical gaps (incoming - existing).
+    - Prints FIRST missing items in terminal only (to avoid GUI noise).
+    - Uses a small heuristic to group gaps into human-readable headings
+      (no heavy LLM usage here so it's deterministic and simple).
+    - Returns the final Technical Skills block as a single string.
+    - Also sets module-level LAST_CANONICAL_GAPS = [..] for optional GUI read.
+    """
+    global LAST_CANONICAL_GAPS
 
-        # parse original block into headings -> exact original items (no normalization)
-        headings = []  # order
-        items_by_heading = {}  # heading -> [exact items]
+    try:
+        # --- normalize input text and locate Technical Skills block ---
+        text = (resume_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = [ln.rstrip() for ln in text.splitlines()]
 
-        # default top-level heading
-        DEFAULT_HEADING = "Technical Skills"
-        headings.append(DEFAULT_HEADING)
-        items_by_heading[DEFAULT_HEADING] = []
+        heading_re = re.compile(r"(?i)^\s*(technical\s*skills|skills|technical\s*expertise|core\s*skills|skills\s*and\s*tools)\s*[:\-–—]?\s*(.*)$")
+        section_end_re = re.compile(r"(?i)^\s*(experience|work experience|education|projects|certifications|profile|summary|professional summary|employment history)\b")
 
-        # parse lines: if "Heading: a, b" present, create subheading; else add to current heading
-        current_heading = DEFAULT_HEADING
-        for ln in orig_block_lines:
-            ln = ln.rstrip()
-            if ":" in ln:
-                left, right = ln.split(":", 1)
-                h = _safe_strip(left)
-                parts = _split_line_to_parts(right)
+        start = None
+        for i, ln in enumerate(lines):
+            if heading_re.match(ln):
+                start = i
+                break
+
+        # if no technical skills heading present -> return minimal block (also set gaps)
+        if start is None:
+            incoming = _normalize_incoming(target_keywords)
+            LAST_CANONICAL_GAPS = incoming[:]  # store full gaps list
+            # Print only the first few missing items to terminal
+            if incoming:
+                print("[generate_keyword_sentences] FIRST missing items (terminal only):", incoming[:5])
+            # Return a simple human-readable block
+            return "Technical Skills:\nOther Technical Skills: " + ", ".join(incoming)
+
+        # determine end of the Technical Skills section
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if not lines[j].strip() or section_end_re.match(lines[j].strip()):
+                end = j
+                break
+
+        block_lines = lines[start:end]
+        orig_block = "\n".join(block_lines).strip()
+
+        # --- parse existing headings and items (simple parse) ---
+        def split_items(s: str):
+            if not s:
+                return []
+            return [p.strip() for p in re.split(r'[,;•\u2022\u2023/|]+', s) if p.strip()]
+
+        items_by_heading: Dict[str, List[str]] = {}
+        DEFAULT = "Other Technical Skills"
+
+        # parse first heading line inline items
+        m0 = heading_re.match(block_lines[0])
+        if m0:
+            inline = (m0.group(2) or "").strip()
+            if inline:
+                items_by_heading.setdefault(DEFAULT, []).extend(split_items(inline))
+
+        current = DEFAULT
+        items_by_heading.setdefault(current, [])
+        for ln in block_lines[1:]:
+            if not ln.strip():
+                continue
+            s = ln.strip()
+            if ':' in s and re.match(r'^[^:]{1,80}:', s):
+                left, right = s.split(':', 1)
+                h = left.strip()
+                items_by_heading.setdefault(h, []).extend(split_items(right))
+                current = h
+            else:
+                parts = split_items(s)
                 if parts:
-                    if h not in items_by_heading:
-                        headings.append(h); items_by_heading[h] = []
-                    for p in parts:
-                        if p not in items_by_heading[h]:
-                            items_by_heading[h].append(p)
-                    current_heading = h
+                    items_by_heading.setdefault(current, []).extend(parts)
+                else:
+                    items_by_heading.setdefault(current, []).append(s)
+
+        # dedupe existing items (case-insensitive)
+        for h in list(items_by_heading.keys()):
+            seen = set(); out = []
+            for it in items_by_heading[h]:
+                if not it:
                     continue
-            # otherwise parse tokens and add to current heading
-            parts = _split_line_to_parts(ln)
-            if parts:
-                for p in parts:
-                    if p not in items_by_heading[current_heading]:
-                        items_by_heading[current_heading].append(p)
+                key = it.strip()
+                kl = key.lower()
+                if kl not in seen:
+                    seen.add(kl); out.append(key.strip())
+            items_by_heading[h] = out
 
-        # If resume had no technical block, ensure DEFAULT exists but empty (we will copy nothing)
-        if DEFAULT_HEADING not in items_by_heading:
-            headings.insert(0, DEFAULT_HEADING)
-            items_by_heading.setdefault(DEFAULT_HEADING, [])
+        # --- normalize incoming target keywords and compute canonical gaps ---
+        incoming = []
+        seen = set()
+        for t in (target_keywords or []):
+            # support dict items and plain strings
+            if isinstance(t, dict):
+                candidate = (t.get("term") or t.get("keyword") or t.get("name") or "").strip()
+            else:
+                candidate = (t or "").strip()
+            if candidate and candidate.lower() not in seen:
+                seen.add(candidate.lower()); incoming.append(candidate)
 
-        # --- placement: append-only ---
-        global_seen = set(x.lower().strip() for arr in items_by_heading.values() for x in (arr or []))
-        remaining_gaps = []
+        existing_lower = {it.lower() for arr in items_by_heading.values() for it in arr}
+        canonical_gaps = [k for k in incoming if k.lower() not in existing_lower]
 
-        def _find_best_heading_for_kw(kw: str) -> Optional[str]:
-            kl = kw.lower()
-            # exact match to an existing item's heading
-            for h, items in items_by_heading.items():
-                for it in (items or []):
-                    if it and it.strip().lower() == kl:
-                        return h
-            # heading token overlap
-            k_toks = set(re.findall(r'\w+', kl))
-            if k_toks:
-                best_h = None; best_score = 0.0
-                for h in headings:
-                    h_toks = set(re.findall(r'\w+', h.lower()))
-                    if not h_toks: continue
-                    inter = k_toks & h_toks
-                    smaller = min(len(k_toks), len(h_toks))
-                    if smaller > 0:
-                        score = len(inter) / smaller
-                        if score > best_score:
-                            best_score = score; best_h = h
-                if best_score >= 0.5:
-                    return best_h
-            # substring with heading
-            for h in headings:
-                if kl in h.lower() or h.lower() in kl:
+        # save full canonical gaps module-level for optional GUI access
+        LAST_CANONICAL_GAPS = canonical_gaps[:]
+
+        # print the FIRST missing items to terminal ONLY (reduce GUI noise)
+        if canonical_gaps:
+            print("[generate_keyword_sentences] FIRST missing items (terminal only):", canonical_gaps[:5])
+        else:
+            print("[generate_keyword_sentences] No missing technical keywords detected.")
+
+        # --- if no gaps, return original block unchanged ---
+        if not canonical_gaps:
+            return orig_block
+
+        # --- simple human-friendly grouping heuristic ---
+        grouping_map = {}
+        for kw in canonical_gaps:
+            k = kw.lower()
+            if any(x in k for x in ("terraform", "ansible", "iac", "infrastructure as code")):
+                cat = "Infrastructure as Code (IaC)"
+            elif any(x in k for x in ("github", "git", "actions", "pipeline", "ci/cd", "ci cd", "pipelines")):
+                cat = "CI/CD & Pipelines"
+            elif any(x in k for x in ("aws", "azure", "gcp", "google cloud", "cloud")):
+                cat = "Cloud / Infrastructure"
+            elif any(x in k for x in ("docker", "kubernetes", "k8s", "container")):
+                cat = "Containerization & Orchestration"
+            elif any(x in k for x in ("prometheus", "grafana", "monitor", "observab", "logging", "tracing")):
+                cat = "Observability / Monitoring"
+            elif any(x in k for x in ("sql", "postgres", "mysql", "mongodb", "database", "nosql", "dynamodb")):
+                cat = "Databases"
+            elif any(x in k for x in ("data", "migration", "etl", "warehouse")):
+                cat = "Data & Migration"
+            elif any(x in k for x in ("react", "angular", "vue", "frontend", "javascript", "typescript")):
+                cat = "Frontend Frameworks"
+            else:
+                cat = "Other Technical Skills"
+            grouping_map.setdefault(cat, []).append(kw)
+
+        # --- insert grouped items: prefer adding to existing similar headings if present ---
+        def find_similar_heading(cat_name: str):
+            cl = cat_name.lower()
+            for h in items_by_heading.keys():
+                hl = h.lower()
+                if cl in hl or hl in cl:
                     return h
-            # no match
             return None
 
-        for kw in merged_candidates:
-            if not kw or not kw.strip(): continue
-            k = kw.strip(); kl = k.lower()
-            if kl in global_seen:
-                # already present verbatim somewhere; skip
-                continue
-            placed = False
-            # 1) deterministic best-heading
-            h = None
-            try:
-                h = _find_best_heading_for_kw(k)
-            except Exception:
-                h = None
-            if h:
-                # append only if not present
-                if k not in items_by_heading.get(h, []):
-                    items_by_heading.setdefault(h, []).append(k)
-                    global_seen.add(kl)
-                placed = True
-
-            # 2) fuzzy heading match fallback (if rapidfuzz available)
-            if not placed and 'RAPIDFUZZ_AVAILABLE' in globals() and RAPIDFUZZ_AVAILABLE:
-                try:
-                    best_score = 0; best_h = None
-                    for hname in headings:
-                        score = fuzz.token_set_ratio(kl, hname.lower())
-                        if score > best_score:
-                            best_score = score; best_h = hname
-                    if best_score >= 84 and best_h:
-                        if k not in items_by_heading.get(best_h, []):
-                            items_by_heading.setdefault(best_h, []).append(k); global_seen.add(kl)
-                        placed = True
-                except Exception:
-                    pass
-
-            if not placed:
-                remaining_gaps.append(k)
-
-        _log("Placement done: placed=%d remaining_gaps=%d", len(merged_candidates) - len(remaining_gaps), len(remaining_gaps))
-
-        # --- if there are remaining gaps, try provider once to map them
-        if remaining_gaps:
-            _log("Attempting provider mapping for %d remaining gaps", len(remaining_gaps))
-            provider = None
-            try:
-                provider = _provider_from_keys(provider_pref, keys or {})
-            except Exception as e:
-                _log("Provider resolution failed: %s", e)
-                provider = None
-
-            mapped = None
-            if provider:
-                sys_prompt = (
-                    "You are a concise resume assistant. Given remaining technical keywords and the job description, "
-                    "return a VALID JSON object mapping heading -> [keywords]. Use existing headings when appropriate. "
-                    "Example: {\"Cloud / DevOps\": [\"terraform\",\"kubernetes\"]}. Output JSON ONLY."
-                )
-                user_prompt = (
-                    "Job Description:\n" + jd_text + "\n\n"
-                    "Existing resume headings:\n" + (", ".join([h for h in headings if items_by_heading.get(h)]) or "<none>") + "\n\n"
-                    "Remaining keywords:\n" + (", ".join(remaining_gaps)) + "\n\n"
-                    "Return a JSON mapping heading to keywords (arrays). Use existing headings when appropriate, "
-                    "but do NOT overwrite or remove any existing resume skill items. If you propose a new heading, "
-                    "return its name exactly as you want it to appear."
-                )
-                try:
-                    out = provider.chat(model=model_name, system=sys_prompt, user=user_prompt,
-                                        temperature=max(0.0, min(0.6, temperature)), max_tokens=max_tokens or 400) or ""
-                    mapped = None
-                    # try to extract json
-                    try:
-                        start = out.find("{"); end = out.rfind("}") + 1
-                        if start != -1 and end > start:
-                            mapped = json.loads(out[start:end])
-                    except Exception:
-                        # best-effort: try to parse whole string
-                        try:
-                            mapped = json.loads(out)
-                        except Exception:
-                            mapped = None
-                except Exception as e:
-                    _log("Provider chat failed or quota: %s", e)
-                    mapped = None
-
-            # merge mapped dict append-only if available
-            if mapped and isinstance(mapped, dict):
-                for new_h, kwlist in mapped.items():
-                    if not kwlist:
-                        continue
-                    # normalize incoming
-                    incoming = []
-                    if isinstance(kwlist, list):
-                        for v in kwlist:
-                            if isinstance(v, str) and v.strip():
-                                incoming.append(v.strip())
-                            else:
-                                incoming.append(str(v).strip())
-                    elif isinstance(kwlist, str):
-                        incoming = _split_line_to_parts(kwlist)
-                    else:
-                        incoming = [str(kwlist).strip()]
-                    # choose canonical heading: prefer existing non-empty headings that match; else use new_h
-                    canonical = None
-                    nh_lower = new_h.strip().lower()
-                    for h in headings:
-                        if items_by_heading.get(h) and len(items_by_heading.get(h, [])) > 0:
-                            if nh_lower == h.lower() or nh_lower in h.lower() or h.lower() in nh_lower:
-                                canonical = h; break
-                    if not canonical:
-                        for h in headings:
-                            if nh_lower == h.lower() or nh_lower in h.lower() or h.lower() in nh_lower:
-                                canonical = h; break
-                    if not canonical:
-                        canonical = new_h.strip()
-                        if canonical.lower() in (hh.lower() for hh in headings):
-                            base = canonical; i = 1
-                            while f"{base} ({i})".lower() in (hh.lower() for hh in headings):
-                                i += 1
-                            canonical = f"{base} ({i})"
-                        if canonical not in headings:
-                            headings.append(canonical); items_by_heading.setdefault(canonical, [])
-                    for kw in incoming:
-                        if not kw: continue
-                        if kw.strip().lower() in global_seen: continue
-                        if kw not in items_by_heading.get(canonical, []):
-                            items_by_heading.setdefault(canonical, []).append(kw); global_seen.add(kw.strip().lower())
+        for cat, kws in grouping_map.items():
+            existing_h = find_similar_heading(cat)
+            if existing_h:
+                for kw in kws:
+                    if kw.lower() not in {x.lower() for x in items_by_heading[existing_h]}:
+                        items_by_heading[existing_h].append(kw)
             else:
-                # fallback: put remaining into "Other Technical Skills"
-                bucket = "Other Technical Skills"
-                if bucket not in items_by_heading:
-                    headings.append(bucket); items_by_heading[bucket] = []
-                for k in remaining_gaps:
-                    if k.strip().lower() not in global_seen:
-                        items_by_heading[bucket].append(k); global_seen.add(k.strip().lower())
+                # append as new heading at bottom
+                items_by_heading.setdefault(cat, [])
+                for kw in kws:
+                    if kw.lower() not in {x.lower() for x in items_by_heading[cat]}:
+                        items_by_heading[cat].append(kw)
 
-        # --- final rendering: copy original items verbatim; appended items will follow
+        # dedupe after merging
+        for h in list(items_by_heading.keys()):
+            seen = set(); out = []
+            for it in items_by_heading[h]:
+                if not it: continue
+                kl = it.strip().lower()
+                if kl not in seen:
+                    seen.add(kl); out.append(it.strip())
+            items_by_heading[h] = out
+
+        # --- rebuild the final technical block (preserve top heading and colon-headings order) ---
         out_lines = []
-        # keep headings order stable and dedupe case-insensitively
-        seen_h = set()
-        ordered_headings = []
-        for h in headings:
-            key = h.strip().lower()
-            if key and key not in seen_h:
-                seen_h.add(key); ordered_headings.append(h)
-
-        for h in ordered_headings:
-            arr = items_by_heading.get(h, []) or []
-            if not arr:
-                continue
-            out_lines.append(f"{h}: {', '.join(arr)}")
-
-        if not out_lines:
-            return "Technical Skills:"
-        return "\n".join(["Technical Skills"] + out_lines).strip()
-    except Exception as exc:
-        # extreme fallback: do not touch resume at all; simply return original technical block plus the raw merged_candidates appended under Other Technical Skills
-        try:
-            print("generate_keyword_sentences fatal error:", exc)
-        except Exception:
-            pass
-        try:
-            orig_block = "\n".join(_find_tech_block_lines(resume_text)) if 'resume_text' in locals() else ""
-            if merged_candidates:
-                appended = ", ".join([c for c in merged_candidates if c])
-                return (("Technical Skills\n" + (orig_block + ("\nOther Technical Skills: " + appended if appended else ""))) if orig_block else ("Technical Skills:\nOther Technical Skills: " + appended))
+        out_lines.append(block_lines[0] if block_lines else "Technical Skills:")
+        emitted = set()
+        for ln in block_lines[1:]:
+            if ':' in ln and re.match(r'^[^:]{1,80}:', ln.strip()):
+                h = ln.split(':', 1)[0].strip()
+                if h in items_by_heading:
+                    out_lines.append(f"{h}: {', '.join(items_by_heading[h])}")
+                    emitted.add(h)
+                else:
+                    out_lines.append(ln)
             else:
-                return "Technical Skills:\n" + (orig_block or "")
-        except Exception:
-            return "Technical Skills:"
+                out_lines.append(ln)
+
+        # append any remaining headings (new ones) at bottom
+        for h, items in items_by_heading.items():
+            if h in emitted:
+                continue
+            if not items:
+                continue
+            out_lines.append(f"{h}: {', '.join(items)}")
+
+        final_block = "\n".join(out_lines).strip()
+        return final_block
+
+    except Exception as e:
+        # conservative fallback: return simple block and keep gaps available for terminal
+        print("[generate_keyword_sentences] error:", e)
+        incoming = [t if isinstance(t, str) else t.get("term", "") for t in (target_keywords or [])]
+        LAST_CANONICAL_GAPS = incoming[:]
+        if incoming:
+            print("[generate_keyword_sentences] FIRST missing items (terminal only):", incoming[:5])
+        return "Technical Skills:\nOther Technical Skills: " + ", ".join(incoming)
 
 
 def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,

@@ -344,6 +344,8 @@ NOTES:
 # -----------------------------
 # Contact Extraction
 # -----------------------------
+from typing import List
+
 SYSTEM_CONTACTS = """Extract contact details from the resume. 
 Return STRICT JSON only.
 Schema: { "name": str, "email": str, "phone": str, "linkedin": str, "github": str }"""
@@ -352,3 +354,16 @@ USER_CONTACTS = """RESUME:
 {resume}
 
 Return JSON only."""
+
+def keyword_optimizer_prompt(jd_text: str, orig_block: str, gaps: List[str]) -> str:
+    return (
+        "You are a professional Keyword Optimizer for resumes. GIVEN:\n"
+        "  1) JOB_DESCRIPTION (context)\n"
+        "  2) ORIGINAL_TECHNICAL_BLOCK (exact text extracted from the resume)\n"
+        "  3) a list of GAP_KEYWORDS\n\n"
+        "TASK (strict):\n"
+        "- Group the GAP_KEYWORDS into concise, domain-appropriate resume headings (1-6 words). Each gap keyword must appear under exactly one heading.\n"
+        "- OPTIONAL: you may include 'final_block' (complete updated Technical Skills section) in the JSON response.\n"
+        "- RETURN JSON only with schema: {\"categories\": {...}, \"final_block\": \"...\"}\n\n"
+        f"JOB_DESCRIPTION:\n{jd_text or ''}\n\nORIGINAL_TECHNICAL_BLOCK:\n{orig_block}\n\nGAP_KEYWORDS:\n{gaps}\n"
+    )

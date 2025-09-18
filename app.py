@@ -19,6 +19,9 @@ from pipeline import (
     extract_gaps,
 )
 
+from typing import List
+# other imports...
+
 import traceback
 import streamlit as st
 
@@ -436,6 +439,53 @@ if resume_text.strip() and jd_text.strip():
             st.session_state["kw_sentences_edit"] = ""
             st.session_state["kw_sentences_saved_text"] = ""
             st.info("Technical skills cleared.")
+    # Ensure kw_sentences_edit in session_state is a string before passing to text_area
+    import json
+
+    def _ensure_str_for_textarea(key: str):
+        """Ensure st.session_state[key] is a string; convert lists/dicts/None safely."""
+        if key not in st.session_state:
+            st.session_state.setdefault(key, "")
+            return
+
+        v = st.session_state.get(key)
+        # If already string, leave it
+        if isinstance(v, str):
+            return
+
+        # If a list/tuple -> join with newlines (preserves per-line skill lists)
+        if isinstance(v, (list, tuple)):
+            try:
+                st.session_state[key] = "\n".join(map(str, v))
+                return
+            except Exception:
+                pass
+
+        # If dict -> pretty JSON
+        if isinstance(v, dict):
+            try:
+                st.session_state[key] = json.dumps(v, ensure_ascii=False, indent=2)
+                return
+            except Exception:
+                pass
+
+        # If None -> empty string
+        if v is None:
+            st.session_state[key] = ""
+            return
+
+        # Fallback: coerce to string (safe)
+        try:
+            st.session_state[key] = str(v)
+        except Exception:
+            # ultimate fallback
+            st.session_state[key] = ""
+
+    # Call the helper for the specific widget key
+    _ensure_str_for_textarea("kw_sentences_edit")
+
+    # Optional debug: display current type in the app for immediate diagnosis (remove later)
+    st.markdown(f"**DEBUG:** kw_sentences_edit type = `{type(st.session_state.get('kw_sentences_edit')).__name__}`")
 
     kw_edit = st.text_area("Technical Skills (editable, plain text; will be inserted after Profile Summary)", key="kw_sentences_edit", height=220)
 
