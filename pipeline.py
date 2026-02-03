@@ -14,7 +14,126 @@ from ai.prompts import (
 from ai.selector import get_provider
 from ai.matcher import match_score, keyword_gaps
 # Add this line among the other imports in pipeline.py
-from ai.llm_keyword_optimizer import jd_to_json, extract_ranked_and_gap_keywords
+from ai.jd_keywords import extract_keywords_from_jd
+from pprint import pprint
+import textwrap
+# ---------- call_llm resolver ----------
+import importlib, sys, logging
+LAST_CANONICAL_GAPS: List[str] = []
+
+logger = logging.getLogger(__name__)
+
+def resolve_call_llm():
+    candidates = [
+        "ai.provider",   # try your exact path first
+        "ai.providers",
+        "providers",
+    ]
+    try:
+        if "." in __name__:
+            pkg = __name__.rsplit(".",1)[0]
+            candidates.extend([f"{pkg}.provider", f"{pkg}.providers"])
+    except Exception:
+        pass
+
+    if "providers" in sys.modules:
+        candidates.insert(0, "providers")
+
+    for name in [c for c in candidates if c]:
+        try:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "call_llm"):
+                fn = getattr(mod, "call_llm")
+                print(f"[resolve_call_llm] call_llm imported from '{name}'")
+                logger.info(f"call_llm imported from '{name}'")
+                return fn
+        except Exception as e:
+            logger.debug(f"[resolve_call_llm] import '{name}' failed: {e}")
+
+    for modname, mod in list(sys.modules.items()):
+        try:
+            if hasattr(mod, "call_llm"):
+                print(f"[resolve_call_llm] call_llm found in loaded module '{modname}'")
+                logger.info(f"call_llm found in loaded module '{modname}'")
+                return getattr(mod, "call_llm")
+        except Exception:
+            pass
+
+    print("[resolve_call_llm] call_llm not found; using local heuristic")
+    logger.warning("call_llm not found; fallback to heuristic")
+    return None
+
+# Optional early resolution
+GLOBAL_CALL_LLM = resolve_call_llm()
+# -------------------------------------------------
+def _normalize_incoming(keywords):
+    out = []
+    seen = set()
+    for t in (keywords or []):
+        if isinstance(t, dict):
+            s = (t.get("term") or t.get("keyword") or t.get("name") or "").strip()
+        else:
+            s = (t or "").strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    return out
+
+# -----------------------
+# Helper: remove resume placeholder headings
+# -----------------------
+import re
+
+# common headings to treat as placeholders when they are empty or standalone
+_PLACEHOLDER_HEADING_RX = re.compile(
+    r'^\s*(technical\s*skills|skills|core\s*competenc(?:y|ies)|core\s*skills|expertise|toolbox|technical\s*expertise|profile\s*summary|summary)\s*[:\-\—\–]?\s*$',
+    flags=re.I
+)
+
+def remove_resume_placeholders(resume_text: str) -> str:
+    """
+    Remove lines that are heading-only placeholders (e.g. "Technical Skills:", "Skills")
+    while preserving real skill lists (e.g. "Python, Docker") and other resume content.
+    Returns cleaned resume string.
+    """
+    if not resume_text:
+        return resume_text or ""
+
+    lines = resume_text.splitlines()
+    cleaned_lines = []
+    for i, ln in enumerate(lines):
+        s = (ln or "").strip()
+        if not s:
+            # preserve blank lines (you may also drop them)
+            cleaned_lines.append("")
+            continue
+
+        # If line looks exactly like a placeholder heading, skip it
+        if _PLACEHOLDER_HEADING_RX.match(s):
+            # Skip the line, but do not skip if the next non-empty line looks like a skill list
+            # e.g. "Technical Skills:" followed by "Python, Docker" -> in that case we want to keep heading or keep list.
+            # So peek next non-empty line:
+            j = i + 1
+            next_line = ""
+            while j < len(lines):
+                nxt = (lines[j] or "").strip()
+                if nxt:
+                    next_line = nxt
+                    break
+                j += 1
+            # if next_line contains comma or slash (likely an actual skill list), keep current heading line removed but keep next_line
+            if next_line and ("," in next_line or "/" in next_line or re.search(r'\b[A-Za-z0-9\+\#\.\-]{2,}\b', next_line)):
+                # do NOT append heading line, but allow next_line to be processed (it will be preserved)
+                continue
+            # otherwise skip the placeholder heading completely
+            continue
+
+        # Otherwise include the line unchanged
+        cleaned_lines.append(ln)
+
+    # Rebuild text and return
+    return "\n".join(cleaned_lines)
+
 
 # -----------------------------
 # Keyword object sanitizer (add right after imports)
@@ -342,356 +461,812 @@ def extract_core_competencies_from_jd(jd_text: str) -> List[str]:
 # -----------------------------
 # Keywords (LLM)
 # -----------------------------
-def extract_keywords_llm(resume_text: str, jd_text: str,
-                         provider_pref: Optional[str], model_name: Optional[str],
-                         temperature: float, max_tokens: int, keys: Dict[str, str]) -> Dict[str, Any]:
+# pipeline.py — wrapper replacement (paste inside existing file)
+from typing import Optional, List, Dict, Any
+from ai.jd_keywords import extract_keywords_from_jd, normalize_text, simple_tokenize, lemmatize_tokens  # normalize_text helper exists above? if not use ai.jd_keywords.normalize_text
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Optional fuzzy lib
+try:
+    from rapidfuzz import fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except Exception:
+    RAPIDFUZZ_AVAILABLE = False
+
+def _fuzzy_match(a: str, b: str) -> int:
     """
-    LLM-driven extraction:
-      - Normalize JD via jd_to_json_via_llm()
-      - Ask LLM to propose keyword candidates (existing behavior)
-      - Ask LLM (strict JSON) to REVIEW the candidates: label accept/reject, provide category, optional stoplist, domain
-      - Trust LLM review to remove noise (no hardcoded stoplists or domain mapping)
-      - Conservative deterministic fallback if LLM fails
-    Returns: {"keywords": [...], "missing": [], "weak": [], "summary": "", "_raw_json": "...", "_filtered_out": [...]}
+    Returns a fuzzy similarity 0..100 between a and b.
+    Uses rapidfuzz if available, otherwise simple heuristics.
     """
-    provider = _provider_from_keys(provider_pref, keys or {})
+    if not a or not b:
+        return 0
+    if RAPIDFUZZ_AVAILABLE:
+        try:
+            return int(fuzz.token_set_ratio(a, b))
+        except Exception:
+            pass
+    # fallback: token overlap ratio
+    toks_a = set(re.findall(r'\w+', a.lower()))
+    toks_b = set(re.findall(r'\w+', b.lower()))
+    if not toks_a or not toks_b:
+        return 0
+    inter = toks_a.intersection(toks_b)
+    score = int(100 * (2 * len(inter) / (len(toks_a) + len(toks_b))))
+    return score
 
-    # 1) Normalize JD via LLM (fallback inside jd_to_json_via_llm)
-    _jd_json = jd_to_json_via_llm(jd_text, provider, model_name, temperature=0.0, max_tokens=800)
-    jd_flat = _jd_json.get("flat", jd_text or "") or ""
-    jd_lines = [ln.get("text", "").strip() for ln in (_jd_json.get("lines") or []) if ln.get("text")]
-    jd_lines_trimmed = [l for l in jd_lines]
-    total_jd_lines = max(1, len(jd_lines_trimmed))
-
-    print("\n=== NORMALIZED JD JSON (used for extraction) ===")
-    try:
-        print(json.dumps(_jd_json, indent=2, ensure_ascii=False))
-    except Exception:
-        print(repr(_jd_json))
-    print("==============================================\n")
-
-    if not jd_flat.strip():
-        return {"keywords": [], "missing": [], "weak": [], "summary": "", "_raw_json": "", "_filtered_out": []}
-
-    # decide top_k for extraction
-    top_k = 60 if (max_tokens is None or max_tokens >= 60) else max(10, int(max(10, max_tokens // 10)))
-
-    # 2) Ask LLM for candidate verbatim keywords (JSON-only) - same as before
-    from ai.prompts import SYSTEM_KEYWORDS, USER_KEYWORDS
-    try:
-        user_payload = USER_KEYWORDS.format(jd=jd_flat, resume=(resume_text or ""), top_k=top_k)
-    except Exception:
-        user_payload = USER_KEYWORDS.format(jd=jd_flat, resume=(resume_text or ""))
-    raw = ""
-    try:
-        raw = provider.chat(model=model_name, system=SYSTEM_KEYWORDS, user=user_payload, temperature=0.0, max_tokens=max_tokens or 800) or ""
-        if not isinstance(raw, str):
-            raw = str(raw or "")
-    except Exception as e:
-        print("Warning: provider.chat failed in extract_keywords_llm (initial candidates):", repr(e))
-        raw = ""
-
-    raw = (raw or "").strip()
-    if raw.lower().startswith("json"):
-        raw = raw[4:].strip()
-    if raw.startswith("```") and raw.endswith("```"):
-        raw = raw.strip("`").strip()
-
-    print("\n=== RAW LLM RESPONSE (candidate block truncated) ===")
-    try:
-        print(raw[:4000])
-    except Exception:
-        print(repr(raw))
-    print("=== END RAW LLM RESPONSE ===\n")
-
-    candidate_block = _first_json_block(raw) or raw or "{}"
-    candidate_block = re.sub(r",\s*(\]|\})", r"\1", candidate_block)
-    candidate_block = candidate_block.replace("“", '"').replace("”", '"').replace("’", "'")
-
-    try:
-        cand_obj = json.loads(candidate_block)
-    except Exception:
-        cand_obj = {"keywords": []}
-    if not isinstance(cand_obj, dict):
-        cand_obj = {"keywords": []}
-
-    cand_list = cand_obj.get("keywords") if isinstance(cand_obj.get("keywords"), list) else []
-    normalized_candidates = []
-    for c in cand_list:
-        if not isinstance(c, dict):
-            if isinstance(c, str) and c.strip():
-                normalized_candidates.append({"term": c.strip(), "variants": [], "evidence": [] , "category": ""})
-            continue
-        term = (c.get("term") or "").strip() if c.get("term") is not None else ""
-        if not term:
-            continue
-        ev = [e for e in (c.get("evidence") or []) if isinstance(e, str) and e.strip()]
-        variants = [v for v in (c.get("variants") or []) if v and isinstance(v, str) and v.strip()]
-        category = (c.get("category") or "") if isinstance(c.get("category", ""), str) else ""
-        normalized_candidates.append({"term": term, "variants": variants, "evidence": ev, "category": category})
-
-    # If no candidates at all, prepare to do deterministic fallback later
-    # 3) ASK THE LLM TO REVIEW & FILTER the candidates (JSON-only). This is the key change:
-    #    We let the LLM return: { "domain": "...", "stoplist": [...], "review":[ {"term":"..","accept":true/false,"category":"Tool|Lang|Other","reason":""}, ... ] }
-    review_prompt_system = (
-        "You are a strict JSON-only reviewer for keyword extraction. "
-        "INPUT: a job description (lines) and a list of candidate keyword objects the first LLM produced. "
-        "TASK (MANDATORY JSON OUTPUT): For each candidate, decide whether it is a valid technical/keyword item to keep (accept) or should be discarded as noise (reject). "
-        "Also return an optional 'stoplist' (short list of obvious noisy tokens you would drop globally) and a single domain label inferred from the JD. "
-        "OUTPUT SCHEMA (JSON only): "
-        "{\"domain\": \"<short domain label>\", \"stoplist\": [\"tok1\",\"tok2\"], \"review\": [ {\"term\":\"...\",\"accept\": true|false, \"category\":\"Tool|Language|Platform|Database|Concept|Responsibility|Other\", \"variants\": [\"...\"], \"reason\": \"(if rejected brief reason)\"}, ... ] } "
-        "REQUIREMENTS: "
-        "- Use ONLY tokens/phrases that appear verbatim in the JD (do not invent synonyms). "
-        "- If a candidate is duplicate/substring noise, mark accept=false and explain briefly in 'reason'. "
-        "- Keep entries concise (single-term or short technical phrase). "
-        "- If uncertain, prefer reject (minimize noise). "
-        "- Temperature=0 behavior: deterministic, JSON only. "
-        "Return valid JSON only matching the schema above. "
-    )
-
-    # Build payload to send to reviewer LLM
-    review_input = {
-        "jd_lines": jd_lines_trimmed,
-        "candidates": normalized_candidates
-    }
-
-    review_user = json.dumps(review_input, ensure_ascii=False, indent=2)
-    review_raw = ""
-    try:
-        review_raw = provider.chat(model=model_name, system=review_prompt_system, user=review_user, temperature=0.0, max_tokens=800) or ""
-        if not isinstance(review_raw, str):
-            review_raw = str(review_raw or "")
-    except Exception as e:
-        print("Warning: provider.chat failed in extract_keywords_llm (review step):", repr(e))
-        review_raw = ""
-
-    review_raw = (review_raw or "").strip()
-    if review_raw.startswith("```") and review_raw.endswith("```"):
-        review_raw = review_raw.strip("`").strip()
-
-    # extract first JSON block
-    review_block = _first_json_block(review_raw) or review_raw or "{}"
-    review_block = review_block.replace("“", '"').replace("”", '"').replace("’", "'")
-    try:
-        review_obj = json.loads(review_block)
-    except Exception:
-        review_obj = {}
-
-    # Interpret review_obj: build accept/reject lists according to LLM review
-    accepted_terms_by_llm = set()
-    rejected_terms_info = []
-    lll_domain = (review_obj.get("domain") or "").strip() if isinstance(review_obj, dict) else ""
-    lll_stoplist = review_obj.get("stoplist") if isinstance(review_obj.get("stoplist"), list) else []
-
-    if isinstance(review_obj.get("review"), list):
-        for r in review_obj.get("review"):
-            if not isinstance(r, dict):
-                continue
-            term = (r.get("term") or "").strip()
-            if not term:
-                continue
-            if r.get("accept"):
-                accepted_terms_by_llm.add(term)
-            else:
-                rejected_terms_info.append({"term": term, "reason": r.get("reason","llm_reject")})
-
-    # 4) Now perform conservative validation + trust LLM accept decisions.
-    #    Accept candidate only if: LLM accepted it AND it's present verbatim in JD lines (or in candidate evidence)
-    def term_in_jd_lines(term: str) -> bool:
-        if not term:
-            return False
-        for ln in jd_lines_trimmed:
-            if term in ln:
-                return True
-        return False
-
-    validated = []
-    filtered_out = []
-
-    for c in normalized_candidates:
-        term = c.get("term","").strip()
-        if not term:
-            continue
-        # If LLM provided review decisions, require it to have accepted
-        if review_obj and isinstance(review_obj.get("review"), list):
-            if term not in accepted_terms_by_llm:
-                # try to capture rejection reason if present
-                reason = next((r["reason"] for r in rejected_terms_info if r.get("term")==term), "rejected_by_llm")
-                filtered_out.append({"term": term, "variants": c.get("variants",[]), "reason": reason})
-                continue
-        # Additional conservative check: ensure term appears somewhere in JD lines OR was supplied as evidence by initial LLM
-        evidence_ok = False
-        for ev in (c.get("evidence") or []):
-            if ev and ev.strip() in jd_lines_trimmed:
-                evidence_ok = True
+def _extract_evidence_sentences(resume_text: str, term: str, max_sentences: int = 2) -> List[str]:
+    """
+    Return up to `max_sentences` sentences from resume_text that contain the keyword term.
+    Simple regex-based sentence splitting.
+    """
+    sents = re.split(r'(?<=[.!?])\s+', (resume_text or "").strip())
+    out = []
+    tnorm = (term or "").lower()
+    for s in sents:
+        if tnorm in s.lower():
+            out.append(s.strip())
+            if len(out) >= max_sentences:
                 break
-        if not evidence_ok and not term_in_jd_lines(term):
-            # if LLM accepted but we cannot find term in JD lines, still allow if variant is present OR evidence non-empty
-            if any(v for v in (c.get("variants") or []) if term_in_jd_lines(v)):
-                evidence_ok = True
-        if not evidence_ok:
-            filtered_out.append({"term": term, "variants": c.get("variants",[]), "reason": "no_exact_jd_evidence"})
-            continue
-        # Passed gates -> accept
-        # Normalize evidence: include jd lines that contain term
-        evs = [ln for ln in jd_lines_trimmed if term in ln]
-        if not evs:
-            evs = c.get("evidence") or []
-        validated.append({"term": term, "variants": c.get("variants",[]), "evidence": evs, "category": c.get("category","") or ""})
+    return out
 
-    # 5) If LLM review returned empty or nothing accepted, fall back to a conservative deterministic augmentation
-    if not validated:
-        # deterministic extraction: extract parenthetical lists and tokens >=2 chars that appear in JD tokens
-        token_re_local = re.compile(r"[A-Za-z0-9\+#\-/\.]{2,}")
-        seen = set()
-        fallback = []
-        for line in jd_lines_trimmed:
-            if not line:
-                continue
-            # parentheticals first
-            for par in re.findall(r"\(([^)]+)\)", line):
-                parts = [p.strip() for p in re.split(r",|;|\band\b|\bor\b", par) if p.strip()]
-                for p in parts:
-                    key = re.sub(r"[^A-Za-z0-9]+"," ", p).strip().lower()
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    fallback.append({"term": p, "variants": [], "evidence": [line], "category": ""})
-            # token-wise
-            for m in token_re_local.finditer(line):
-                cand = m.group(0).strip().strip(",:;.-")
-                key = re.sub(r"[^A-Za-z0-9]+"," ", cand).strip().lower()
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                fallback.append({"term": cand, "variants": [], "evidence": [line], "category": ""})
-        # keep short fallback
-        validated = fallback[:80]
+# ---------------------------
+# STEP 0: Domain extraction (LLM)
+# ---------------------------
+# ---------------------------
+# STEP 0: Domain extraction (LLM + IT domain mapping)
+# ---------------------------
 
-    # Deterministic ranking (frequency + early position)
-    ranked = []
-    token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    jd_tokens = [t.lower() for t in token_re.findall(jd_flat or "")]
-    jd_compact = "".join(jd_tokens)
-    def tok_seq(s: str):
-        return [t.lower() for t in token_re.findall(s or "")]
+STEP0_SYSTEM = (
+    "You are an assistant that identifies the primary IT domain/discipline of a job description. "
+    "Return exactly one IT domain such as 'backend', 'frontend', 'fullstack', 'data science', "
+    "'machine learning', 'ai', 'cloud', 'devops', 'security', 'mobile', 'testing', 'qa', "
+    "'blockchain', 'database', 'infrastructure', 'networking', 'product management', 'ui/ux'. "
+    "If multiple apply, pick the one that dominates most of the responsibilities."
+)
+STEP0_USER_TMPL = "Job Description:\n\n{jd}\n\nReturn the single most relevant IT domain."
 
-    for item in validated:
-        term = (item.get("term") or "").strip()
-        if not term:
-            continue
-        ev_lines_idx = set()
-        for idx, ln in enumerate(jd_lines_trimmed):
-            if term in ln:
-                ev_lines_idx.add(idx)
-        frequency = len(ev_lines_idx) if ev_lines_idx else max(1, len(item.get("evidence",[]) or [1]))
-        earliest_idx = min(ev_lines_idx) if ev_lines_idx else (total_jd_lines + 1)
-        heading_boost = 0
-        for idx in ev_lines_idx:
-            for back in range(max(0, idx-2), idx):
-                hdr = jd_lines_trimmed[back].strip().lower()
-                if hdr.endswith(":") or hdr in ("responsibilities", "requirements"):
-                    heading_boost = 1
-                    break
-        early_pos_bonus = 1 if earliest_idx < max(1, int(0.1 * total_jd_lines)) else 0
-        score = 3 * frequency + 2 * heading_boost + early_pos_bonus
-        ranked.append({"term": term, "variants": item.get("variants",[]), "evidence": item.get("evidence",[]), "category": item.get("category","") or "Other", "score": score, "earliest_idx": earliest_idx})
+# Canonical IT domains
+IT_DOMAINS = {
+    "backend": ["backend", "server-side", "api", "microservices"],
+    "frontend": ["frontend", "ui", "react", "angular", "vue", "javascript"],
+    "fullstack": ["fullstack", "end-to-end"],
+    "data science": ["data science", "analytics", "machine learning", "ml engineer"],
+    "machine learning": ["ml", "machine learning", "ai engineer", "deep learning"],
+    "ai": ["ai", "artificial intelligence", "nlp", "computer vision"],
+    "cloud": ["cloud", "aws", "azure", "gcp", "cloud engineer"],
+    "devops": ["devops", "sre", "infrastructure as code", "terraform", "ansible", "cicd"],
+    "security": ["security", "infosec", "cybersecurity"],
+    "mobile": ["mobile", "android", "ios", "react native", "flutter"],
+    "testing": ["testing", "qa", "automation testing", "selenium"],
+    "blockchain": ["blockchain", "web3", "solidity", "crypto"],
+    "database": ["database", "db admin", "sql", "nosql"],
+    "infrastructure": ["infrastructure", "systems engineer", "platform"],
+    "networking": ["network", "tcp/ip", "router", "firewall"],
+    "product management": ["product manager", "pm", "product owner"],
+    "ui/ux": ["ui", "ux", "design", "figma", "user experience"],
+}
 
-    ranked.sort(key=lambda x: (-x.get("score",0), x.get("earliest_idx", total_jd_lines + 1)))
+def llm_domain_extract(jd_text: str, model: Optional[str] = None, temperature: float = 0.0,
+                       provider: Optional[str] = None, provider_keys: Optional[Dict[str, str]] = None) -> str:
+    """
+    Step 0: Extract the IT domain of the JD.
+    1) Ask provider for domain guess.
+    2) Normalize and map against IT_DOMAINS.
+    3) If no match, fallback to 'general-it'.
+    """
+    if not jd_text or not jd_text.strip():
+        return "general-it"
 
-    # Build final list, dedupe, and add ranks
-    final_kw = []
-    seen_terms = set()
-    rank_counter = 1
-    for ent in ranked:
-        t = (ent.get("term") or "").strip()
-        if not t:
-            continue
-        key = re.sub(r"[^A-Za-z0-9]+"," ", t).strip().lower()
-        if not key or key in seen_terms:
-            continue
-        seen_terms.add(key)
-        variants = [v for v in (ent.get("variants") or []) if isinstance(v,str) and v.strip()]
-        evidence = [e for e in (ent.get("evidence") or []) if isinstance(e,str) and e.strip()]
-        category = ent.get("category") or "Other"
-        final_kw.append({"rank": rank_counter, "term": t, "category": category, "variants": variants, "evidence": evidence})
-        rank_counter += 1
-
-    # Build missing/weak lists by comparing to resume deterministically
-    res_token_re = re.compile(r"[A-Za-z0-9#+.]+")
-    resume_tokens = [t.lower() for t in res_token_re.findall(resume_text or "")]
-    resume_compact = "".join(resume_tokens)
-
-    def present_in_resume_strict(seq_tokens: List[str]) -> bool:
-        if not seq_tokens:
-            return False
-        L = len(seq_tokens)
-        for i in range(0, len(resume_tokens) - L + 1):
-            if resume_tokens[i:i+L] == seq_tokens:
-                return True
-        if "".join(seq_tokens) in resume_compact:
-            return True
-        if L == 1 and len(seq_tokens[0]) > 3:
-            base = seq_tokens[0]; alt = base[:-1] if base.endswith("s") else base + "s"
-            if base in resume_tokens or alt in resume_tokens:
-                return True
-        return False
-
-    missing = []
-    weak = []
-    top_candidates = final_kw[:60]
-    for ent in top_candidates:
-        seq = tok_seq(ent.get("term", ""))
-        if not seq:
-            continue
-        if not present_in_resume_strict(seq):
-            if "".join(seq) in resume_compact:
-                weak.append(ent["term"])
-            else:
-                missing.append(ent["term"])
-
-    def dedupe_list(arr, limit=None):
-        out=[]; seen=set()
-        for x in arr:
-            if not isinstance(x,str):
-                continue
-            k = x.strip().lower()
-            if not k or k in seen:
-                continue
-            seen.add(k); out.append(x)
-            if limit and len(out) >= limit:
-                break
-        return out
-
-    missing = dedupe_list(missing, limit=10)
-    weak = dedupe_list(weak, limit=10)
-
-    result = {
-        "keywords": final_kw,
-        "missing": missing,
-        "weak": weak,
-        "summary": f"Extracted {len(final_kw)} keywords; LLM-reviewed filtering applied.",
-        "_raw_json": candidate_block,
-        "_filtered_out": filtered_out
-    }
-
-    # Defensive normalization and debug shaping
-    result["keywords"] = _normalize_keyword_list(result.get("keywords", []))
     try:
-        result["_filtered_out"] = [{"term": f.get("term") if isinstance(f,dict) else str(f), "reason": f.get("reason","")} for f in (result.get("_filtered_out") or [])]
+        out = _call_llm_system_user(
+            STEP0_SYSTEM,
+            STEP0_USER_TMPL.format(jd=jd_text),
+            model=model,
+            temperature=temperature,
+            max_tokens=64,
+            provider=provider,
+            provider_keys=provider_keys,
+        )
+    except Exception as e:
+        logger.debug("llm_domain_extract provider call failed: %s", e)
+        out = ""
+
+    if not out or not isinstance(out, str):
+        return "general-it"
+
+    guess = out.strip().lower()
+    guess = re.sub(r'[^a-z0-9\s\-/]', '', guess)  # clean up punctuation
+
+    # Match guess to IT domains
+    for domain, patterns in IT_DOMAINS.items():
+        for pat in patterns:
+            if pat in guess:
+                return domain
+
+    # fallback: try keyword search in JD text itself
+    jd_low = jd_text.lower()
+    for domain, patterns in IT_DOMAINS.items():
+        for pat in patterns:
+            if pat in jd_low:
+                return domain
+
+    # default fallback
+    return "general-it"
+
+
+# Keyword extraction 3 steps pipeline:
+# --- 3-layer JD keyword extraction (drop-in) ---
+import os
+import re
+import json
+import logging
+from typing import List, Dict, Any, Optional, Tuple, Set
+
+logger = logging.getLogger(__name__)
+
+# LLM client: OpenAI wrapper (adjust to your provider if needed)
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")  # change as you like
+if OPENAI_AVAILABLE and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+# NLP & utilities (optional libs with fallbacks)
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+    _nlp = spacy.load("en_core_web_sm")
+except Exception:
+    SPACY_AVAILABLE = False
+    _nlp = None
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
+try:
+    from sentence_transformers import SentenceTransformer, util as st_util
+    SENTEVAL_AVAILABLE = True
+    SENTEVAL_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+except Exception:
+    SENTEVAL_AVAILABLE = False
+    SENTEVAL_MODEL = None
+
+try:
+    from rapidfuzz import fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except Exception:
+    RAPIDFUZZ_AVAILABLE = False
+
+# --- Helper: safe LLM call with JSON extraction ---
+def _call_llm_system_user(system_prompt: str, user_prompt: str,
+                          model: Optional[str] = None,
+                          temperature: float = 0.0,
+                          max_tokens: int = 800,
+                          provider: Optional[str] = None,
+                          provider_keys: Optional[Dict[str, str]] = None) -> str:
+    """
+    Provider-aware LLM call used by the 3-layer extraction pipeline.
+    REQUIREMENTS:
+      - provider: string that matches the provider selectbox in the UI (e.g. "openai", "gemini", "anthropic")
+      - provider_keys: dict of keys (e.g. {"openai": "sk-...", "gemini": "...", ...})
+    Behavior:
+      1. Try ai.providers.call_llm(...) if available.
+      2. Else, look for ProviderClass in ai.providers (e.g. OpenAIProvider) and instantiate it with provider_keys.
+      3. If neither is present or a call fails, raise RuntimeError with a clear message.
+    Note: This function intentionally does NOT fallback to environment OPENAI_API_KEY — the GUI must supply provider + key.
+    """
+    # Require provider selected by the UI
+    if not provider:
+        raise RuntimeError("No LLM provider selected. Please select a provider in the UI and provide its API key.")
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    # Import providers module
+    try:
+        import ai.providers as providers_module
+    except Exception as e:
+        raise RuntimeError(f"Failed to import ai.providers module: {e}")
+
+    # 1) If providers_module exposes call_llm, use it (support a couple of common signatures)
+    if hasattr(providers_module, "call_llm") and callable(getattr(providers_module, "call_llm")):
+        try:
+            # Preferred signature:
+            return providers_module.call_llm(provider_name=provider,
+                                             messages=messages,
+                                             model=model,
+                                             temperature=temperature,
+                                             max_tokens=max_tokens,
+                                             keys=provider_keys or {})
+        except TypeError:
+            # Fallback signature: call_llm(messages, provider, **opts)
+            try:
+                return providers_module.call_llm(messages, provider, model=model,
+                                                 temperature=temperature, max_tokens=max_tokens, keys=provider_keys or {})
+            except Exception as e:
+                raise RuntimeError(f"ai.providers.call_llm raised an error (fallback signature): {e}")
+        except Exception as e:
+            raise RuntimeError(f"ai.providers.call_llm raised an error: {e}")
+
+    # 2) If call_llm not present, try Provider class lookup and instantiation
+    # Map common provider names to class names (you can extend this map)
+    provider_map = {
+        "openai": "OpenAIProvider",
+        "gemini": "GeminiProvider",
+        "anthropic": "AnthropicProvider"
+    }
+    cls_name = provider_map.get(provider.lower(), provider.capitalize() + "Provider")
+
+    # Ensure class exists in ai.providers
+    if not hasattr(providers_module, cls_name):
+        # list available provider class candidates for helpful error message
+        candidates = [n for n in dir(providers_module) if n.endswith("Provider")]
+        raise RuntimeError(f"Provider class '{cls_name}' not found in ai.providers. Available provider classes: {candidates}")
+
+    ProviderClass = getattr(providers_module, cls_name)
+
+    # instantiate provider class with provider_keys (constructor signature may differ)
+    try:
+        # If provider constructor expects dict, pass provider_keys; else try no-arg init -> set keys attribute
+        try:
+            provider_instance = ProviderClass(provider_keys or {})
+        except TypeError:
+            # try no-arg constructor then set keys if attribute present
+            provider_instance = ProviderClass()
+            if hasattr(provider_instance, "set_keys") and callable(provider_instance.set_keys):
+                provider_instance.set_keys(provider_keys or {})
+            elif hasattr(provider_instance, "keys"):
+                try:
+                    setattr(provider_instance, "keys", provider_keys or {})
+                except Exception:
+                    pass
+    except Exception as e:
+        raise RuntimeError(f"Failed to instantiate provider class '{cls_name}': {e}")
+
+    # Ensure provider instance has a chat/complete method
+    chat_fn = None
+    if hasattr(provider_instance, "chat") and callable(getattr(provider_instance, "chat")):
+        chat_fn = provider_instance.chat
+    elif hasattr(provider_instance, "complete") and callable(getattr(provider_instance, "complete")):
+        chat_fn = provider_instance.complete
+    elif hasattr(provider_instance, "call") and callable(getattr(provider_instance, "call")):
+        chat_fn = provider_instance.call
+
+    if not chat_fn:
+        raise RuntimeError(f"Provider class '{cls_name}' does not implement a callable 'chat' / 'complete' / 'call' method.")
+
+    # Call provider's chat method. Many provider chat methods accept system+user separately, or a single messages list.
+    try:
+        # Try calling with (model, system, user, temperature, max_tokens)
+        try:
+            return chat_fn(model=model, system=system_prompt, user=user_prompt, temperature=temperature, max_tokens=max_tokens)
+        except TypeError:
+            # Try calling with single messages parameter
+            try:
+                return chat_fn(messages=messages, model=model, temperature=temperature, max_tokens=max_tokens)
+            except TypeError:
+                # Try positional messages
+                return chat_fn(messages, model, temperature, max_tokens)
+    except Exception as e:
+        raise RuntimeError(f"Provider '{cls_name}' chat call failed: {e}")
+
+
+def _extract_json_from_text(text: str) -> Any:
+    """
+    Robust JSON extraction from an LLM response string.
+    Returns a parsed JSON object (dict/list) or None on failure.
+    Attempts:
+      1. Direct json.loads(text)
+      2. Regex extract first {...} or [...] block and json.loads
+      3. Progressive trimming of trailing characters to salvage near-JSON
+    """
+    import json
+    import re
+    if not text or not isinstance(text, str):
+        return None
+
+    # 1) direct parse fast-path
+    try:
+        return json.loads(text)
     except Exception:
         pass
 
-    print("\n=== FINAL KEYWORDS OBJECT (returned to caller) ===")
+    # 2) find first {...} or [...] block
+    m = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', text)
+    if not m:
+        return None
+
+    candidate = m.group(1).strip()
+
+    # 3) try to parse candidate. If it fails, progressively trim trailing characters and retry.
+    # This helps when the LLM appends extra commentary after JSON.
+    for trim in range(0, min(200, len(candidate))):
+        try:
+            # attempt to parse progressively smaller suffixes removed
+            maybe = candidate[:len(candidate) - trim]
+            return json.loads(maybe)
+        except Exception:
+            continue
+
+    # 4) final attempt: try replacing single quotes with double quotes (some LLMs use JS-style single quotes)
     try:
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        alt = candidate.replace("'", "\"")
+        return json.loads(alt)
     except Exception:
-        print(repr(result))
-    print("=================================================\n")
+        pass
 
+    # If we can't parse, return None and let caller fall back to deterministic logic
+    return None
+
+
+# ---------------------------
+# STEP 1: Broad LLM extraction
+# ---------------------------
+STEP1_SYSTEM = (
+    "You are a meticulous reader. Extract every possible keyword (technical skills, tools, "
+    "frameworks, methodologies, soft skills, and responsibilities) from the job description. "
+    "Output as a comma-separated list only—do NOT output explanation or JSON—just items separated by commas."
+)
+STEP1_USER_TMPL = "Job Description:\n\n{jd}\n\nExtract keywords as comma-separated list."
+
+def llm_broad_extract(jd_text: str, model: Optional[str] = None, temperature: float = 0.0,
+                      provider: Optional[str] = None, provider_keys: Optional[Dict[str, str]] = None) -> List[str]:
+    """
+    Step 1: broad generative extraction via the selected provider.
+    """
+    try:
+        out = _call_llm_system_user(STEP1_SYSTEM,
+                                   STEP1_USER_TMPL.format(jd=jd_text),
+                                   model=model,
+                                   temperature=temperature,
+                                   max_tokens=600,
+                                   provider=provider,
+                                   provider_keys=provider_keys)
+    except Exception as e:
+        logger.exception("LLM broad extract failed: %s", e)
+        return []
+
+    # split by common delimiters (commas, semicolons, newlines, bullets, dashes)
+    parts = re.split(r'[,;\n•\-\r]+', out)
+    tokens = [p.strip() for p in parts if p and p.strip()]
+    return tokens
+
+
+
+# ---------------------------
+# STEP 2: LLM refinement & classification
+# ---------------------------
+STEP2_SYSTEM = (
+    "You are a strict data cleaner. Receive a list of items and return a JSON object with three arrays: "
+    "'Technical Skills', 'Soft Skills', 'Responsibilities'. Remove duplicates and items that are not true keywords. "
+    "Normalize items (trim whitespace, remove excessive punctuation). Output valid JSON ONLY."
+)
+STEP2_USER_TMPL = "Raw items:\n\n{items}\n\nClassify and clean them into JSON."
+
+def llm_refine_and_classify(items: List[str], model: Optional[str] = None, temperature: float = 0.0,
+                            provider: Optional[str] = None, provider_keys: Optional[Dict[str, str]] = None) -> Dict[str, List[str]]:
+    """
+    Step 2: use LLM to refine Step1 items into categories and perform tech/noise reconciliation.
+    Returns dict with keys: Technical Skills, Noise, Soft Skills, Responsibilities
+    """
+    # prepare default return
+    empty_struct = {"Technical Skills": [], "Noise": [], "Soft Skills": [], "Responsibilities": []}
+    if not items:
+        return empty_struct
+
+    joined = ", ".join(items)
+    try:
+        out = _call_llm_system_user(
+            STEP2_SYSTEM,
+            STEP2_USER_TMPL.format(items=joined),
+            model=model,
+            temperature=temperature,
+            max_tokens=800,
+            provider=provider,
+            provider_keys=provider_keys
+        )
+    except Exception as e:
+        logger.exception("LLM refine failed (provider call): %s", e)
+        # fallback deterministic classification to at least fill Tech/Noise/Soft/Resp
+        tech, soft, resp, noise = [], [], [], []
+        for it in items:
+            low = (it or "").lower()
+            if re.search(r'\b(python|java|c#|c\+\+|sql|docker|kubernetes|aws|azure|gcp|terraform|ansible|jenkins|git|scala|rust|go|typescript|react|node)\b', low):
+                tech.append(it.strip())
+            elif re.search(r'\b(manage|lead|collaborate|communicat|organize|present|team|design|develop)\b', low):
+                resp.append(it.strip())
+            elif len(low.split()) <= 3 and re.search(r'^[a-zA-Z]+$', low):
+                # short single words are probably tech / keep heuristic
+                tech.append(it.strip())
+            else:
+                noise.append(it.strip())
+        return {"Technical Skills": list(dict.fromkeys(tech)),
+                "Noise": list(dict.fromkeys(noise)),
+                "Soft Skills": list(dict.fromkeys(soft)),
+                "Responsibilities": list(dict.fromkeys(resp))}
+
+    parsed = _extract_json_from_text(out)
+    if not parsed or not isinstance(parsed, dict):
+        # log raw output for debugging
+        logger.debug("LLM refine output (non-JSON or parse failed): %s", out)
+        # Use deterministic fallback as above
+        tech, soft, resp, noise = [], [], [], []
+        for it in items:
+            low = (it or "").lower()
+            if re.search(r'\b(python|java|c#|c\+\+|sql|docker|kubernetes|aws|azure|gcp|terraform|ansible|jenkins|git|scala|rust|go|typescript|react|node)\b', low):
+                tech.append(it.strip())
+            elif re.search(r'\b(manage|lead|collaborate|communicat|organize|present|team|design|develop)\b', low):
+                resp.append(it.strip())
+            elif len(low.split()) <= 3 and re.search(r'^[a-zA-Z]+$', low):
+                tech.append(it.strip())
+            else:
+                noise.append(it.strip())
+        return {"Technical Skills": list(dict.fromkeys(tech)),
+                "Noise": list(dict.fromkeys(noise)),
+                "Soft Skills": list(dict.fromkeys(soft)),
+                "Responsibilities": list(dict.fromkeys(resp))}
+
+    # Normalize parsed outputs to lists for expected keys; accept extra keys as Noise
+    tech = parsed.get("Technical Skills", []) if isinstance(parsed.get("Technical Skills", []), list) else []
+    soft = parsed.get("Soft Skills", []) if isinstance(parsed.get("Soft Skills", []), list) else []
+    resp = parsed.get("Responsibilities", []) if isinstance(parsed.get("Responsibilities", []), list) else []
+    # Any other items from parsed put into noise; also include parsed.get("Noise")
+    noise = parsed.get("Noise", []) if isinstance(parsed.get("Noise", []), list) else []
+
+    # also catch stray values under unknown keys
+    for k, v in parsed.items():
+        if k not in ("Technical Skills", "Soft Skills", "Responsibilities", "Noise") and isinstance(v, list):
+            for it in v:
+                noise.append(it)
+
+    # deterministic verification: move suspicious items between tech <-> noise
+    verified_tech = []
+    verified_noise = []
+
+    tech_patterns = re.compile(r'\b(python|java|c#|c\+\+|sql|docker|kubernetes|aws|azure|gcp|terraform|ansible|jenkins|git|scala|rust|go|typescript|react|node|django|flask|spring)\b', re.I)
+    # If an item in tech looks like noise (too long generic phrase or contains stopwords), move to noise
+    for t in tech:
+        tstr = (t or "").strip()
+        low = tstr.lower()
+        if len(low.split()) > 6 or low in STRONG_STOPWORDS or re.search(r'\b(experience|years|responsible|work|team|role|company|apply)\b', low):
+            verified_noise.append(tstr)
+        else:
+            verified_tech.append(tstr)
+
+    # If item in noise looks like tech, move to tech
+    for n in noise:
+        nstr = (n or "").strip()
+        if tech_patterns.search(nstr):
+            verified_tech.append(nstr)
+        else:
+            verified_noise.append(nstr)
+
+    # dedupe preserving order
+    def dedupe_keep_order(seq):
+        seen = set(); out = []
+        for s in seq:
+            if not s: continue
+            k = s.lower().strip()
+            if k not in seen:
+                seen.add(k); out.append(s)
+        return out
+
+    verified_tech = dedupe_keep_order(verified_tech)
+    verified_noise = dedupe_keep_order(verified_noise)
+    soft = dedupe_keep_order(soft)
+    resp = dedupe_keep_order(resp)
+
+    return {"Technical Skills": verified_tech, "Noise": verified_noise, "Soft Skills": soft, "Responsibilities": resp}
+
+
+# ---------------------------
+# STEP 3: Deterministic filtering & normalization
+# ---------------------------
+# strong stoplist
+STRONG_STOPWORDS = set([
+    "experience","years","year","candidate","responsibilities","responsibility","work","works","working",
+    "requirements","preferred","should","will","including","including:","knowledge","knowledgeable","ability","able"
+])
+
+def _normalize_token(tok: str) -> str:
+    tok = tok.strip()
+    # remove surrounding punctuation
+    tok = re.sub(r'^[^\w]+|[^\w]+$', '', tok)
+    tok = tok.replace('_',' ').strip()
+    return tok
+
+def deterministic_filter_and_normalize(structured: Optional[Dict[str, List[str]]],
+                                       jd_text: str,
+                                       top_n: int = 40,
+                                       min_token_len: int = 2,
+                                       use_spacy: bool = True,
+                                       use_semantic_grouping: bool = False,
+                                       semantic_threshold: float = 0.88) -> Dict[str, List[str]]:
+    """
+    Final deterministic cleaning:
+      - Accepts structured (may be None) and returns cleaned dict with keys:
+        'Technical Skills', 'Soft Skills', 'Responsibilities'
+      - Defensive: if structured is None or malformed, returns empty lists for keys.
+    """
+    # Defensive default if structured is None or not a mapping
+    if not structured or not isinstance(structured, dict):
+        logger.debug("deterministic_filter_and_normalize: received invalid structured input; substituting empty structure.")
+        structured = {"Technical Skills": [], "Soft Skills": [], "Responsibilities": []}
+
+    # flatten all items into a list of (category, raw)
+    flat: List[Tuple[str, str]] = []
+    for cat in ("Technical Skills", "Soft Skills", "Responsibilities"):
+        items = structured.get(cat) if isinstance(structured.get(cat, []), list) else []
+        for it in items:
+            flat.append((cat, it))
+
+    cleaned_by_cat: Dict[str, List[str]] = {"Technical Skills": [], "Soft Skills": [], "Responsibilities": []}
+    seen_norm: Set[str] = set()
+
+    # spaCy doc of JD for optional context
+    jd_doc = _nlp(jd_text) if use_spacy and SPACY_AVAILABLE and _nlp else None
+
+    for cat, raw in flat:
+        if not raw or not str(raw).strip():
+            continue
+        norm = _normalize_token(str(raw))
+        if not norm or len(re.sub(r'[^A-Za-z]', '', norm)) < min_token_len:
+            continue
+        if re.search(r'\d', norm) and not re.search(r'[A-Za-z]', norm):
+            # drop pure numbers
+            continue
+        if norm.lower() in STRONG_STOPWORDS:
+            continue
+
+        # POS filtering if spaCy is available
+        if use_spacy and SPACY_AVAILABLE and jd_doc is not None:
+            try:
+                tok_doc = _nlp(norm)
+                keep = False
+                for t in tok_doc:
+                    if t.pos_ in ("NOUN", "PROPN"):
+                        keep = True
+                    if not t.is_alpha and any(ch.isdigit() or ch in "+#./-" for ch in t.text):
+                        keep = True
+                if not keep:
+                    continue
+            except Exception:
+                # If spaCy parsing fails for this token, continue with best-effort keep
+                logger.debug("spaCy parsing failed for token '%s' — keeping by fallback", norm)
+
+        final_norm = norm.strip()
+        if final_norm.lower() in seen_norm:
+            continue
+        seen_norm.add(final_norm.lower())
+        cleaned_by_cat.setdefault(cat, []).append(final_norm)
+
+    # Optional semantic grouping handled elsewhere; keep ordering deterministic
+    for k in cleaned_by_cat:
+        cleaned_by_cat[k] = sorted(list(dict.fromkeys(cleaned_by_cat[k])), key=lambda x: x.lower())
+
+    return cleaned_by_cat
+
+# ---------------------------
+# Orchestrator that runs all 3 steps
+# ---------------------------
+def three_layer_extract_and_normalize(jd_text: str,
+                                      model_step1: Optional[str] = None,
+                                      model_step2: Optional[str] = None,
+                                      provider: Optional[str] = None,
+                                      provider_keys: Optional[Dict[str, str]] = None,
+                                      use_spacy: bool = True,
+                                      use_semantic_grouping: bool = False,
+                                      semantic_threshold: float = 0.88,
+                                      top_n: int = 40,
+                                      min_score: float = 0.0) -> Dict[str, List[str]]:
+    """
+    Orchestrator enhanced:
+      Step0: domain extraction
+      Step1: broad LLM extraction
+      Step2: refine & classify (with tech<->noise reconciliation)
+      Step2.1: ensure JD technical keywords are included
+      Step2.2: re-run reconciliation
+      Step3: deterministic filter & normalize
+    """
+    # Step 0: domain
+    domain = None
+    try:
+        domain = llm_domain_extract(jd_text, model=model_step1, temperature=0.0, provider=provider, provider_keys=provider_keys)
+        logger.debug("Detected JD domain: %s", domain)
+    except Exception as e:
+        logger.debug("Domain extraction failed: %s", e)
+        domain = None
+
+    # Step 1: broad extraction (LLM)
+    try:
+        step1 = llm_broad_extract(jd_text, model=model_step1, temperature=0.0, provider=provider, provider_keys=provider_keys)
+    except Exception as e:
+        logger.exception("Step1 (broad extract) failed: %s", e)
+        step1 = []
+
+    # Step 2: refine & classify via LLM into Technical Skills / Noise / Soft / Responsibilities
+    try:
+        step2_struct = llm_refine_and_classify(step1, model=model_step2, temperature=0.0, provider=provider, provider_keys=provider_keys)
+    except Exception as e:
+        logger.exception("Step2 (refine & classify) raised an exception: %s", e)
+        step2_struct = {"Technical Skills": [], "Noise": [], "Soft Skills": [], "Responsibilities": []}
+
+    # Defensive coercion
+    if not step2_struct or not isinstance(step2_struct, dict):
+        step2_struct = {"Technical Skills": [], "Noise": [], "Soft Skills": [], "Responsibilities": []}
+    for k in ("Technical Skills", "Noise", "Soft Skills", "Responsibilities"):
+        if not isinstance(step2_struct.get(k, []), list):
+            step2_struct[k] = [str(step2_struct.get(k))] if step2_struct.get(k) else []
+
+    # Step 2.1: ensure JD deterministic technical keywords are present
+    try:
+        from ai.jd_keywords import extract_keywords_from_jd as deterministic_jd_kw
+        # get deterministic high-precision tech keywords from JD
+        det_cands = deterministic_jd_kw(jd_text or "", top_n=80, min_score=0.18, use_spacy=use_spacy) or []
+        # extract only skill-category keywords returned by jd_keywords
+        det_techs = []
+        for c in det_cands:
+            kw = c.get("keyword") if isinstance(c, dict) else c
+            cat = c.get("category") if isinstance(c, dict) else None
+            if kw and (not cat or cat.lower() == "skill" or cat.lower() == "tool"):
+                det_techs.append(str(kw).strip())
+        # Add any deterministic tech keywords missing in step2_struct['Technical Skills']
+        existing_lower = set([t.lower() for t in step2_struct.get("Technical Skills", [])])
+        for dt in det_techs:
+            if dt and dt.lower() not in existing_lower:
+                logger.debug("Step2.1: adding deterministic tech '%s' to Technical Skills", dt)
+                step2_struct["Technical Skills"].append(dt)
+                existing_lower.add(dt.lower())
+    except Exception as e:
+        logger.debug("Step2.1 deterministic augment failed: %s", e)
+
+    # Step 2.2: re-run tech<->noise reconciliation using same verification logic
+    try:
+        # reuse llm_refine_and_classify verification logic by calling a small in-memory reconciliation
+        # Here implement same deterministic verification as in llm_refine_and_classify (without LLM calls)
+        tech_list = list(step2_struct.get("Technical Skills", []))
+        noise_list = list(step2_struct.get("Noise", []))
+
+        tech_patterns = re.compile(r'\b(python|java|c#|c\+\+|sql|docker|kubernetes|aws|azure|gcp|terraform|ansible|jenkins|git|scala|rust|go|typescript|react|node|django|flask|spring)\b', re.I)
+        verified_tech = []
+        verified_noise = []
+
+        for t in tech_list:
+            tstr = (t or "").strip()
+            low = tstr.lower()
+            if len(low.split()) > 6 or low in STRONG_STOPWORDS or re.search(r'\b(experience|years|responsible|work|team|role|company|apply)\b', low):
+                verified_noise.append(tstr)
+            else:
+                verified_tech.append(tstr)
+
+        for n in noise_list:
+            nstr = (n or "").strip()
+            if tech_patterns.search(nstr):
+                verified_tech.append(nstr)
+            else:
+                verified_noise.append(nstr)
+
+        # dedupe
+        def dedupe_keep_order(seq):
+            seen = set(); out = []
+            for s in seq:
+                if not s: continue
+                k = s.lower().strip()
+                if k not in seen:
+                    seen.add(k); out.append(s)
+            return out
+
+        step2_struct["Technical Skills"] = dedupe_keep_order(verified_tech)
+        step2_struct["Noise"] = dedupe_keep_order(verified_noise)
+    except Exception as e:
+        logger.debug("Step2.2 reconciliation failed: %s", e)
+
+    # Step 3: deterministic filter & normalization using existing function
+    # Build a structure accepted by deterministic_filter_and_normalize:
+    # We will pass 'Technical Skills' as Technical Skills, merge Noise into a 'Noise' bucket
+    structured_for_step3 = {
+        "Technical Skills": step2_struct.get("Technical Skills", []),
+        "Soft Skills": step2_struct.get("Soft Skills", []),
+        "Responsibilities": step2_struct.get("Responsibilities", [])
+    }
+    # We purposely ignore Noise in final deterministic normalization (it will be filtered out by rules).
+    cleaned = deterministic_filter_and_normalize(structured_for_step3, jd_text,
+                                                 top_n=top_n, use_spacy=use_spacy,
+                                                 use_semantic_grouping=use_semantic_grouping,
+                                                 semantic_threshold=semantic_threshold)
+    # Optionally attach the noise list for debugging downstream
+    cleaned["_noise_raw"] = step2_struct.get("Noise", [])
+    cleaned["_domain"] = domain
+    return cleaned
+
+
+
+
+# ---------------------------
+# Backwards-compatible wrapper for your app
+# ---------------------------
+def extract_keywords_llm(resume_text: str, jd_text: str,
+                         provider_pref: Optional[str] = None, model_name: Optional[str] = None,
+                         temperature: float = 0.0, max_tokens: int = 1024, keys: Dict[str, str] = {}) -> Dict[str, Any]:
+    """
+    Wrapper preserving old signature. Runs three-layer extraction and then does resume matching
+    (you can keep your existing strict resume-match logic after we get final keywords).
+    Returns a dictionary with 'keywords' (list matched), 'missing', 'summary', '_raw_extraction'.
+    """
+    # run three-layer extraction (models for steps can be customized via model_name or env)
+    try:
+        cleaned = three_layer_extract_and_normalize(jd_text,
+                                                    model_step1=None,
+                                                    model_step2=None,
+                                                    provider=provider_pref,
+                                                    provider_keys=keys,
+                                                    use_spacy=True,
+                                                    use_semantic_grouping=False)
+
+
+    except Exception as e:
+        logger.exception("Three-layer extraction failed: %s", e)
+        cleaned = {"Technical Skills": [], "Soft Skills": [], "Responsibilities": []}
+
+    # flattened "final JD keywords"
+    final_keywords = []
+    for cat in ["Technical Skills", "Soft Skills", "Responsibilities"]:
+        for kw in cleaned.get(cat, []):
+            final_keywords.append({"keyword": kw, "category": cat, "explanation": ""})
+
+    # now perform resume filtering (strict) — minimal version: exact substring / token subset / lemma subset / fuzzy
+    resume_norm = (resume_text or "").lower()
+    resume_norm = re.sub(r'\s+', ' ', resume_norm).strip()
+    resume_tokens = re.findall(r'\w+', resume_norm)
+
+    matched = []
+    missing = []
+    rank = 1
+    for item in final_keywords:
+        term = item["keyword"]
+        term_norm = term.lower()
+        found = False
+        # exact
+        if term_norm in resume_norm:
+            found = True
+        # token subset
+        if not found:
+            tks = re.findall(r'\w+', term_norm)
+            if tks and set(tks).issubset(set(resume_tokens)):
+                found = True
+        # fuzzy
+        if not found and RAPIDFUZZ_AVAILABLE:
+            score = fuzz.token_set_ratio(term_norm, resume_norm)
+            if score >= 88:
+                found = True
+        if found:
+            matched.append({"rank": rank, "term": term, "category": item["category"], "explanation": item.get("explanation",""), "evidence": _extract_evidence_sentences(resume_text, term)})
+            rank += 1
+        else:
+            missing.append({"term": term, "category": item["category"], "explanation": item.get("explanation","")})
+
+    result = {
+        "keywords": matched,
+        "missing": missing,
+        "weak": [],
+        "summary": f"Three-layer extraction: {len(matched)} matched, {len(missing)} missing.",
+        "_raw_extraction": cleaned
+    }
     return result
-
-
+# ---------------------------
 
 def enforce_jd_keywords(obj, jd_text: str, resume_text: str):
     """
@@ -965,281 +1540,331 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
 
 
 # -----------------------------
-# Keyword Sentences -> now returns structured Technical Skills (heading -> list)
+# Generate Technical Skills (LLM) -> now returns structured Technical Skills (heading -> list)
 # -----------------------------
-def generate_keyword_sentences(resume_text: str, jd_text: str, target_keywords: List[str],
-                               provider_pref: Optional[str], model_name: Optional[str],
-                               temperature: float, max_tokens: int, keys: Dict[str, str]) -> str:
+# Paste this into pipeline.py replacing the old generate_keyword_sentences
+# ---------- call_llm resolver + generate_keyword_sentences ----------
+import importlib
+import sys
+import re
+import json
+import logging
+from typing import List, Optional, Dict
+
+logger = logging.getLogger(__name__)
+
+def resolve_call_llm():
     """
-    Generate a grouped Technical Skills block for insertion into the resume.
-
-    Behavior (non-domain-specific):
-    - Preserve resume headings & order; resume content is source-of-truth.
-    - Merge LLM-provided headings/items but do not invent domain-specific headings.
-    - Place new keywords in an existing heading if a simple heading-token overlap exists,
-      otherwise append to fallback "Technical Skills".
-    - Remove duplicates and avoid injecting long prose as skill items.
-    - Return plain text block starting with "Technical Skills" then "Heading: item1, item2" lines.
+    Try multiple module names to find `call_llm`. Includes your path `ai.provider`.
+    Returns the function or None.
     """
-    provider = _provider_from_keys(provider_pref, keys or {})
+    candidates = [
+        "ai.provider",               # your stated location
+        "ai.providers",
+        "providers",
+    ]
+    # package-relative tries (if this module lives in a package)
+    try:
+        if "." in __name__:
+            candidates.append(__name__.rsplit(".", 1)[0] + ".provider")
+            candidates.append(__name__.rsplit(".", 1)[0] + ".providers")
+    except Exception:
+        pass
 
-    # 1) Call LLM (leave this behavior unchanged)
-    kws_blob = "\n".join(f"- {k}" for k in (target_keywords or []))
-    user_prompt = USER_KEYWORD_SENTENCES.format(jd=(jd_text or ""), resume=(resume_text or ""), keywords=kws_blob)
-    raw = provider.chat(model=model_name, system=SYSTEM_KEYWORD_SENTENCES, user=user_prompt, temperature=temperature, max_tokens=max_tokens or 600)
-    raw = (raw or "").strip().strip("`").strip()
+    # prefer already-loaded 'providers' if present
+    if "providers" in sys.modules:
+        candidates.insert(0, "providers")
 
-    # 2) Try to parse JSON output; otherwise parse heuristically
-    skills_obj = {"skills": {}}
-    def _try_parse_json(s: str):
+    for name in [c for c in candidates if c]:
         try:
-            start = s.find("{"); end = s.rfind("}") + 1
-            if start >= 0 and end > start:
-                obj = json.loads(s[start:end])
-                if isinstance(obj, dict) and "skills" in obj and isinstance(obj["skills"], dict):
-                    return obj
+            mod = importlib.import_module(name)
+            if hasattr(mod, "call_llm"):
+                fn = getattr(mod, "call_llm")
+                print(f"[resolve_call_llm] call_llm imported from '{name}'")
+                logger.info(f"call_llm imported from '{name}'")
+                return fn
+        except Exception as e:
+            # debug info, but keep trying others
+            print(f"[resolve_call_llm] import '{name}' failed: {e}")
+
+    # last attempt: scan already-loaded modules
+    for modname, mod in list(sys.modules.items()):
+        try:
+            if hasattr(mod, "call_llm"):
+                print(f"[resolve_call_llm] call_llm found in loaded module '{modname}'")
+                logger.info(f"call_llm found in loaded module '{modname}'")
+                return getattr(mod, "call_llm")
         except Exception:
-            pass
-        return None
+            continue
 
-    parsed = _try_parse_json(raw)
-    if parsed:
-        skills_obj = {"skills": {}}
-        for h, arr in (parsed.get("skills") or {}).items():
-            items = []
-            if isinstance(arr, list):
-                for v in arr:
-                    if isinstance(v, str) and v.strip():
-                        items.append(v.strip())
-                    else:
-                        items.append(str(v).strip())
-            elif isinstance(arr, str):
-                items = [p.strip() for p in re.split(r",|\u2022", arr) if p.strip()]
-            else:
-                items = [str(arr).strip()]
-            if items:
-                skills_obj["skills"][h.strip()] = items
-    else:
-        # fallback: parse "Heading: a, b" lines or bullets
-        skills_obj = {"skills": {}}
-        for ln in raw.splitlines():
-            ln = ln.strip()
-            if not ln:
-                continue
-            if ":" in ln:
-                left, right = ln.split(":", 1)
-                heading = left.strip()
-                items = [p.strip() for p in re.split(r",|\u2022", right) if p.strip()]
-                if items:
-                    skills_obj["skills"].setdefault(heading, []).extend(items)
-            else:
-                toks = [t.strip() for t in re.split(r",|\u2022|\t", ln) if t.strip()]
-                if toks:
-                    skills_obj["skills"].setdefault("Technical Skills", []).extend(toks)
+    print("[resolve_call_llm] call_llm NOT found; will use local heuristic")
+    logger.warning("call_llm NOT found; falling back to local heuristic")
+    return None
 
-    # Helpers: detect short, skill-like fragments and extract tokens from resume lines
-    def _is_short_skill(s: str) -> bool:
-        if not s or not s.strip():
-            return False
-        s = s.strip()
-        # drop markers only
-        if re.fullmatch(r"[-•▪‣·\s]+", s):
-            return False
-        words = s.split()
-        # drop long prose (> 8 words)
-        if len(words) > 8:
-            return False
-        # drop obvious role/prose lines
-        if re.search(r"\b(role|responsib|project|experience|since|from|to|with|present|manager|engineer|joined|company)\b", s, flags=re.I):
-            return False
-        return True
+# Resolve early (optional). generate_keyword_sentences will also call resolve_call_llm() at runtime.
+GLOBAL_CALL_LLM = resolve_call_llm()
+def _normalize_token(s: str) -> str:
+    """Lowercase, remove trivial wrapper words and punctuation for matching."""
+    if not s:
+        return ""
+    s = str(s).strip()
+    # remove common wrapper words that often appear in gaps
+    s = re.sub(r'^(using|with|experience\s+in|knowledge\s+of)\s+', '', s, flags=re.I)
+    # normalize separators
+    s = s.replace('-', ' ').replace('/', ' ').replace('_', ' ')
+    # remove punctuation except + (e.g., C++)
+    s = re.sub(r'[^\w\s\+]', '', s)
+    return " ".join(s.split()).lower()
 
-    def _extract_skill_tokens_from_line(line: str) -> List[str]:
-        if not line or not line.strip():
-            return []
-        s = line.strip()
-        s = re.sub(r"^[-•▪‣·*]\s*", "", s).strip()
-        if "," in s:
-            parts = [p.strip() for p in s.split(",") if p.strip()]
-            return [p for p in parts if _is_short_skill(p)]
-        if _is_short_skill(s):
-            return [s]
-        return []
+def _clean_keyword_for_insert(s: str) -> str:
+    """Make a human-friendly normalized insert: prefer 'GitHub Actions' instead of 'using GitHub Actions' etc."""
+    if not s:
+        return ""
+    s0 = s.strip()
+    # common fixes
+    s0 = re.sub(r'^(using|with)\s+', '', s0, flags=re.I)
+    s0 = s0.replace('Terraform/Ansible', 'Terraform, Ansible')
+    # normalize spacing and punctuation
+    s0 = re.sub(r'\s+', ' ', s0).strip()
+    # Title-case common product names selectively (keep acronyms)
+    # Minimal: preserve 'GitHub Actions' or 'GitHub' casing
+    if re.search(r'github', s0, flags=re.I):
+        if re.search(r'actions', s0, flags=re.I):
+            return "GitHub Actions"
+        return "GitHub"
+    if re.search(r'\bterraform\b', s0, flags=re.I):
+        return "Terraform"
+    if re.search(r'\bansible\b', s0, flags=re.I):
+        return "Ansible"
+    return s0
 
-    # 3) Parse resume to find existing skill headings and items (preserve order)
-    def _find_resume_skill_sections(text: str):
-        lines = (text or "").splitlines()
-        sections = []
-        for i, line in enumerate(lines):
-            s = line.strip()
+def _dedupe_preserve_order(lst: List[str]) -> List[str]:
+    seen = set(); out = []
+    for x in lst:
+        if not x: continue
+        kl = x.strip().lower()
+        if kl not in seen:
+            seen.add(kl); out.append(x.strip())
+    return out
+
+def generate_keyword_sentences(resume_text: str,
+                               jd_text: str,
+                               target_keywords: List[str],
+                               provider_pref: Optional[str],
+                               model_name: Optional[str],
+                               temperature: float,
+                               max_tokens: int,
+                               keys: Dict[str, str]) -> str:
+    """
+    Simplified, human-readable Technical Skills generator:
+    - Extracts the Technical Skills block from resume_text (by heading).
+    - Computes canonical gaps (incoming - existing).
+    - Prints FIRST missing items in terminal only (to avoid GUI noise).
+    - Uses a small heuristic to group gaps into human-readable headings
+      (no heavy LLM usage here so it's deterministic and simple).
+    - Returns the final Technical Skills block as a single string.
+    - Also sets module-level LAST_CANONICAL_GAPS = [..] for optional GUI read.
+    """
+    global LAST_CANONICAL_GAPS
+
+    try:
+        # --- normalize input text and locate Technical Skills block ---
+        text = (resume_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = [ln.rstrip() for ln in text.splitlines()]
+
+        heading_re = re.compile(r"(?i)^\s*(technical\s*skills|skills|technical\s*expertise|core\s*skills|skills\s*and\s*tools)\s*[:\-–—]?\s*(.*)$")
+        section_end_re = re.compile(r"(?i)^\s*(experience|work experience|education|projects|certifications|profile|summary|professional summary|employment history)\b")
+
+        start = None
+        for i, ln in enumerate(lines):
+            if heading_re.match(ln):
+                start = i
+                break
+
+        # if no technical skills heading present -> return minimal block (also set gaps)
+        if start is None:
+            incoming = _normalize_incoming(target_keywords)
+            LAST_CANONICAL_GAPS = incoming[:]  # store full gaps list
+            # Print only the first few missing items to terminal
+            if incoming:
+                print("[generate_keyword_sentences] FIRST missing items (terminal only):", incoming[:5])
+            # Return a simple human-readable block
+            return "Technical Skills:\nOther Technical Skills: " + ", ".join(incoming)
+
+        # determine end of the Technical Skills section
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if not lines[j].strip() or section_end_re.match(lines[j].strip()):
+                end = j
+                break
+
+        block_lines = lines[start:end]
+        orig_block = "\n".join(block_lines).strip()
+
+        # --- parse existing headings and items (simple parse) ---
+        def split_items(s: str):
             if not s:
+                return []
+            return [p.strip() for p in re.split(r'[,;•\u2022\u2023/|]+', s) if p.strip()]
+
+        items_by_heading: Dict[str, List[str]] = {}
+        DEFAULT = "Other Technical Skills"
+
+        # parse first heading line inline items
+        m0 = heading_re.match(block_lines[0])
+        if m0:
+            inline = (m0.group(2) or "").strip()
+            if inline:
+                items_by_heading.setdefault(DEFAULT, []).extend(split_items(inline))
+
+        current = DEFAULT
+        items_by_heading.setdefault(current, [])
+        for ln in block_lines[1:]:
+            if not ln.strip():
                 continue
-            if re.match(r"(?i)^(technical\s*skills|skills|core\s*competencies|core\s*skills|expertise|toolbox|technical\s*expertise)\s*[:\-–—]?\s*$", s):
-                start = i + 1
-                end = len(lines)
-                for j in range(start, len(lines)):
-                    nxt = lines[j].strip()
-                    if not nxt:
-                        end = j
-                        break
-                    if re.match(r"(?i)^(work\s*experience|experience|education|projects|certifications|awards|publications|professional\s*summary|profile\s*summary)\s*[:\-–—]?\s*$", nxt):
-                        end = j
-                        break
-                block = [lines[k].rstrip() for k in range(start, end) if lines[k].strip()]
-                sections.append((s.rstrip(":"), block))
-        return sections
-
-    resume_sections = _find_resume_skill_sections(resume_text)
-
-    merged_headings = []
-    merged_skills = {}
-
-    for heading, block_lines in resume_sections:
-        items = []
-        for ln in block_lines:
-            toks = _extract_skill_tokens_from_line(ln)
-            for t in toks:
-                if t and t.strip():
-                    items.append(t.strip())
-        seen_local = set(); final_items = []
-        for it in items:
-            kl = it.lower()
-            if kl in seen_local:
-                continue
-            seen_local.add(kl); final_items.append(it)
-        if final_items:
-            merged_headings.append(heading)
-            merged_skills[heading] = final_items
-
-    # 4) Merge LLM-provided headings/items without domain inference
-    for h, arr in (skills_obj.get("skills") or {}).items():
-        if not arr:
-            continue
-        items_short = [i.strip() for i in arr if isinstance(i, str) and _is_short_skill(i.strip())]
-        if not items_short:
-            continue
-        if h in merged_skills:
-            exist = {x.lower() for x in merged_skills[h]}
-            for it in items_short:
-                if it.lower() not in exist:
-                    merged_skills[h].append(it); exist.add(it.lower())
-        else:
-            # avoid adding headings that obviously look like prose sections
-            if re.match(r"(?i)^(work\s*experience|experience|education|projects|requirements|role|responsibilit)s?", h):
-                continue
-            merged_headings.append(h)
-            merged_skills[h] = []
-            seen_h = set()
-            for it in items_short:
-                if it.lower() not in seen_h:
-                    merged_skills[h].append(it); seen_h.add(it.lower())
-
-    # 5) Build a simple JD heading map (short fragments only) - used only to help placement, not to infer domains
-    jd_lines = [ln.strip() for ln in (jd_text or "").splitlines() if ln.strip()]
-    jd_heading_map = {}
-    for i, ln in enumerate(jd_lines):
-        s = ln.strip()
-        if re.match(r"^[A-Za-z0-9 \-]{1,80}\s*:$", s):
-            h = s.rstrip(":").strip()
-            start = i + 1
-            end = len(jd_lines)
-            for j in range(start, len(jd_lines)):
-                nxt = jd_lines[j].strip()
-                if not nxt or re.match(r"^[A-Za-z0-9 \-]{1,80}\s*:$", nxt):
-                    end = j
-                    break
-            block = [ln2.strip() for ln2 in jd_lines[start:end] if ln2.strip()]
-            tokens = []
-            for bl in block:
-                parts = [p.strip() for p in re.split(r",|\u2022", bl) if p.strip()]
-                for p in parts:
-                    if _is_short_skill(p):
-                        tokens.append(p)
-            if tokens:
-                jd_heading_map[h] = tokens
-
-    # 6) Insert target_keywords preserving resume order; append to matching heading or fallback
-    fallback = "Technical Skills"
-    global_seen = set()
-    for h in merged_headings:
-        for it in merged_skills.get(h, []):
-            global_seen.add(it.lower())
-
-    # process each target keyword in order
-    for kw in (target_keywords or []):
-        if not kw or not kw.strip():
-            continue
-        kws = kw.strip()
-        kl = kws.lower()
-        if kl in global_seen:
-            continue
-        placed = False
-        # 6a) place under an existing resume heading if simple token overlap
-        for heading in merged_headings:
-            h_low = heading.lower()
-            h_tokens = re.findall(r"[A-Za-z0-9]+", h_low)
-            k_tokens = re.findall(r"[A-Za-z0-9]+", kl)
-            if any(ht in kt or kt in ht for ht in h_tokens for kt in k_tokens):
-                merged_skills.setdefault(heading, []).append(kws)
-                global_seen.add(kl)
-                placed = True
-                break
-        if placed:
-            continue
-        # 6b) place under JD heading if exact short fragment match
-        for jh, tokens in jd_heading_map.items():
-            if any(kws.lower() == t.lower() for t in tokens):
-                if jh in merged_skills:
-                    merged_skills[jh].append(kws)
+            s = ln.strip()
+            if ':' in s and re.match(r'^[^:]{1,80}:', s):
+                left, right = s.split(':', 1)
+                h = left.strip()
+                items_by_heading.setdefault(h, []).extend(split_items(right))
+                current = h
+            else:
+                parts = split_items(s)
+                if parts:
+                    items_by_heading.setdefault(current, []).extend(parts)
                 else:
-                    merged_headings.append(jh)
-                    merged_skills[jh] = [kws]
-                global_seen.add(kl)
-                placed = True
-                break
-        if placed:
-            continue
-        # 6c) fallback - append to Technical Skills at the end (ensure fallback exists last)
-        if fallback not in merged_skills:
-            merged_headings.append(fallback)
-            merged_skills[fallback] = []
-        merged_skills[fallback].append(kws)
-        global_seen.add(kl)
+                    items_by_heading.setdefault(current, []).append(s)
 
-    # 7) Final cleanup: dedupe each heading preserving order and remove non-short items
-    out_lines = []
-    for heading in merged_headings:
-        items = merged_skills.get(heading, []) or []
-        cleaned = []
-        seen_local = set()
-        for it in items:
-            if not isinstance(it, str):
-                it = str(it)
-            it_s = it.strip()
-            if not it_s:
-                continue
-            if not _is_short_skill(it_s):
-                # allow if exact match present in JD heading tokens (rare)
-                if not any(it_s.lower() == t.lower() for vs in jd_heading_map.values() for t in vs):
+        # dedupe existing items (case-insensitive)
+        for h in list(items_by_heading.keys()):
+            seen = set(); out = []
+            for it in items_by_heading[h]:
+                if not it:
                     continue
-            key = it_s.lower()
-            if key in seen_local:
-                continue
-            seen_local.add(key)
-            cleaned.append(it_s)
-        if cleaned:
-            out_lines.append(f"{heading}: {', '.join(cleaned)}")
+                key = it.strip()
+                kl = key.lower()
+                if kl not in seen:
+                    seen.add(kl); out.append(key.strip())
+            items_by_heading[h] = out
 
-    if not out_lines:
-        # fallback output if nothing found
-        filtered_targets = [k.strip() for k in (target_keywords or []) if _is_short_skill(k)]
-        if filtered_targets:
-            out_lines = [f"Technical Skills: {', '.join(filtered_targets)}"]
+        # --- normalize incoming target keywords and compute canonical gaps ---
+        incoming = []
+        seen = set()
+        for t in (target_keywords or []):
+            # support dict items and plain strings
+            if isinstance(t, dict):
+                candidate = (t.get("term") or t.get("keyword") or t.get("name") or "").strip()
+            else:
+                candidate = (t or "").strip()
+            if candidate and candidate.lower() not in seen:
+                seen.add(candidate.lower()); incoming.append(candidate)
+
+        existing_lower = {it.lower() for arr in items_by_heading.values() for it in arr}
+        canonical_gaps = [k for k in incoming if k.lower() not in existing_lower]
+
+        # save full canonical gaps module-level for optional GUI access
+        LAST_CANONICAL_GAPS = canonical_gaps[:]
+
+        # print the FIRST missing items to terminal ONLY (reduce GUI noise)
+        if canonical_gaps:
+            print("[generate_keyword_sentences] FIRST missing items (terminal only):", canonical_gaps[:5])
         else:
-            out_lines = ["Technical Skills:"]
+            print("[generate_keyword_sentences] No missing technical keywords detected.")
 
-    # Prepend the UI title line "Technical Skills" as before
-    return "\n".join(["Technical Skills"] + out_lines).strip()
+        # --- if no gaps, return original block unchanged ---
+        if not canonical_gaps:
+            return orig_block
+
+        # --- simple human-friendly grouping heuristic ---
+        grouping_map = {}
+        for kw in canonical_gaps:
+            k = kw.lower()
+            if any(x in k for x in ("terraform", "ansible", "iac", "infrastructure as code")):
+                cat = "Infrastructure as Code (IaC)"
+            elif any(x in k for x in ("github", "git", "actions", "pipeline", "ci/cd", "ci cd", "pipelines")):
+                cat = "CI/CD & Pipelines"
+            elif any(x in k for x in ("aws", "azure", "gcp", "google cloud", "cloud")):
+                cat = "Cloud / Infrastructure"
+            elif any(x in k for x in ("docker", "kubernetes", "k8s", "container")):
+                cat = "Containerization & Orchestration"
+            elif any(x in k for x in ("prometheus", "grafana", "monitor", "observab", "logging", "tracing")):
+                cat = "Observability / Monitoring"
+            elif any(x in k for x in ("sql", "postgres", "mysql", "mongodb", "database", "nosql", "dynamodb")):
+                cat = "Databases"
+            elif any(x in k for x in ("data", "migration", "etl", "warehouse")):
+                cat = "Data & Migration"
+            elif any(x in k for x in ("react", "angular", "vue", "frontend", "javascript", "typescript")):
+                cat = "Frontend Frameworks"
+            else:
+                cat = "Other Technical Skills"
+            grouping_map.setdefault(cat, []).append(kw)
+
+        # --- insert grouped items: prefer adding to existing similar headings if present ---
+        def find_similar_heading(cat_name: str):
+            cl = cat_name.lower()
+            for h in items_by_heading.keys():
+                hl = h.lower()
+                if cl in hl or hl in cl:
+                    return h
+            return None
+
+        for cat, kws in grouping_map.items():
+            existing_h = find_similar_heading(cat)
+            if existing_h:
+                for kw in kws:
+                    if kw.lower() not in {x.lower() for x in items_by_heading[existing_h]}:
+                        items_by_heading[existing_h].append(kw)
+            else:
+                # append as new heading at bottom
+                items_by_heading.setdefault(cat, [])
+                for kw in kws:
+                    if kw.lower() not in {x.lower() for x in items_by_heading[cat]}:
+                        items_by_heading[cat].append(kw)
+
+        # dedupe after merging
+        for h in list(items_by_heading.keys()):
+            seen = set(); out = []
+            for it in items_by_heading[h]:
+                if not it: continue
+                kl = it.strip().lower()
+                if kl not in seen:
+                    seen.add(kl); out.append(it.strip())
+            items_by_heading[h] = out
+
+        # --- rebuild the final technical block (preserve top heading and colon-headings order) ---
+        out_lines = []
+        out_lines.append(block_lines[0] if block_lines else "Technical Skills:")
+        emitted = set()
+        for ln in block_lines[1:]:
+            if ':' in ln and re.match(r'^[^:]{1,80}:', ln.strip()):
+                h = ln.split(':', 1)[0].strip()
+                if h in items_by_heading:
+                    out_lines.append(f"{h}: {', '.join(items_by_heading[h])}")
+                    emitted.add(h)
+                else:
+                    out_lines.append(ln)
+            else:
+                out_lines.append(ln)
+
+        # append any remaining headings (new ones) at bottom
+        for h, items in items_by_heading.items():
+            if h in emitted:
+                continue
+            if not items:
+                continue
+            out_lines.append(f"{h}: {', '.join(items)}")
+
+        final_block = "\n".join(out_lines).strip()
+        return final_block
+
+    except Exception as e:
+        # conservative fallback: return simple block and keep gaps available for terminal
+        print("[generate_keyword_sentences] error:", e)
+        incoming = [t if isinstance(t, str) else t.get("term", "") for t in (target_keywords or [])]
+        LAST_CANONICAL_GAPS = incoming[:]
+        if incoming:
+            print("[generate_keyword_sentences] FIRST missing items (terminal only):", incoming[:5])
+        return "Technical Skills:\nOther Technical Skills: " + ", ".join(incoming)
 
 
 def polish_keyword_sentences(resume_text: str, bullets_text: str, jd_text: str,
@@ -1430,7 +2055,7 @@ def _parse_block_to_headings(block: str) -> Dict[str, List[str]]:
         if ":" in ln:
             left, right = ln.split(":", 1)
             heading = left.strip()
-            items = [p.strip() for p in re.split(r",|\u2022", right) if p.strip()]
+            items = [p.strip() for p in re.split(r"[,\u2022\u2023\u2024\u2025/|;]+", right) if p.strip()]
             if items:
                 out.setdefault(heading, []).extend(items)
         else:
@@ -1931,3 +2556,167 @@ def extract_ats_llm_from_optimizer(resume_text: str, optimizer_obj: Dict[str, An
             fixed_sugg.append({"term": s.get("term", ""), "section": s.get("section", "Core Competencies"), "how": s.get("how", "")})
     obj["suggestions"] = fixed_sugg
     return obj
+
+# ----------------------------
+# Non-invasive tracing / instrumentation
+# Add this block AFTER the original function definitions.
+# It wraps the existing functions and prints human-readable step info,
+# but DOES NOT change their behavior or return values.
+# ----------------------------
+
+from functools import wraps
+from pprint import pprint
+import time
+
+def _short_repr(x, maxlen=400):
+    """Short safe string representation for logging."""
+    try:
+        if x is None:
+            return "(none)"
+        if isinstance(x, str):
+            s = x.strip()
+            return (s[:maxlen] + "...") if len(s) > maxlen else s
+        if isinstance(x, (list, tuple, set)):
+            return f"{type(x).__name__}({len(x)}) -> {str(list(x)[:20])[:maxlen]}"
+        if isinstance(x, dict):
+            # show keys only
+            ks = list(x.keys())[:50]
+            return f"dict(keys={ks})"
+        return str(x)[:maxlen]
+    except Exception:
+        return "<unprintable>"
+
+def trace_step(step_name: str, show_inputs: bool = True, show_output: bool = True):
+    """
+    Decorator factory to trace function calls in a human-readable terminal format.
+    Use like: @trace_step('Step 1: Broad Extract')
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            start = time.time()
+            print("\n" + "=" * 80)
+            print(f"[PIPELINE TRACE] START: {step_name}")
+            if show_inputs:
+                # print a short summary of main inputs
+                try:
+                    # attempt to find jd_text or items/resume_text in args/kwargs
+                    if kwargs.get("jd_text") is not None:
+                        print(" JD (preview):", _short_repr(kwargs.get("jd_text")))
+                    elif len(args) >= 1 and isinstance(args[0], str) and len(args[0]) > 0:
+                        # assume first arg is jd_text for many functions
+                        print(" Preview input[0]:", _short_repr(args[0]))
+                    elif kwargs.get("items") is not None:
+                        print(" Items count:", len(kwargs.get("items")) if kwargs.get("items") else 0)
+                    elif len(args) >= 1 and isinstance(args[0], (list,tuple)):
+                        print(" Items count:", len(args[0]))
+                except Exception:
+                    pass
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as e:
+                duration = time.time() - start
+                print(f"[PIPELINE TRACE] {step_name} RAISED EXCEPTION after {duration:.2f}s: {e}")
+                print("=" * 80 + "\n")
+                raise
+            duration = time.time() - start
+
+            if show_output:
+                # print a concise but human-readable summary of the output
+                try:
+                    if isinstance(result, dict):
+                        # show main keys and counts
+                        keys = list(result.keys())
+                        print(" Output keys:", keys)
+                        # If token lists present, show counts and preview
+                        for k in ("tokens", "Technical Skills", "Noise", "Soft Skills", "Responsibilities"):
+                            if k in result:
+                                v = result[k]
+                                try:
+                                    if isinstance(v, list):
+                                        print(f"  - {k}: count={len(v)}  preview={_short_repr(v[:10])}")
+                                    else:
+                                        print(f"  - {k}: {_short_repr(v)}")
+                                except Exception:
+                                    pass
+                    elif isinstance(result, list):
+                        print(f" Output: list of length {len(result)}; preview: {_short_repr(result[:20])}")
+                    elif isinstance(result, str):
+                        print(" Output (string preview):", _short_repr(result, maxlen=800))
+                    else:
+                        print(" Output preview:", _short_repr(result))
+                except Exception:
+                    print(" Output: (unprintable summary)")
+            print(f"[PIPELINE TRACE] END: {step_name}  (elapsed {duration:.2f}s)")
+            print("=" * 80 + "\n")
+            return result
+        return wrapper
+    return decorator
+
+# Wrap existing functions non-destructively.
+# Save originals in case you need to call them directly.
+try:
+    # wrap llm_broad_extract
+    if 'llm_broad_extract' in globals():
+        _orig_llm_broad_extract = llm_broad_extract
+        llm_broad_extract = trace_step("Step 1 — Broad LLM extraction (llm_broad_extract)")(llm_broad_extract)
+
+    # wrap llm_refine_and_classify
+    if 'llm_refine_and_classify' in globals():
+        _orig_llm_refine_and_classify = llm_refine_and_classify
+        llm_refine_and_classify = trace_step("Step 2 — Refine & classify (llm_refine_and_classify)")(llm_refine_and_classify)
+
+    # wrap three_layer_extract_and_normalize
+    if 'three_layer_extract_and_normalize' in globals():
+        _orig_three_layer = three_layer_extract_and_normalize
+        three_layer_extract_and_normalize = trace_step("Orchestrator — three_layer_extract_and_normalize", show_inputs=True, show_output=True)(three_layer_extract_and_normalize)
+
+    # Optionally wrap extract_keywords_llm to show resume matching summary
+    if 'extract_keywords_llm' in globals():
+        _orig_extract_keywords_llm = extract_keywords_llm
+        def _extract_wrapper(*args, **kwargs):
+            # Print header with provider/resume/JD preview
+            provider = kwargs.get("provider_pref", None) if "provider_pref" in kwargs else (args[2] if len(args) > 2 else None)
+            jd_preview = None
+            resume_preview = None
+            try:
+                jd_preview = kwargs.get("jd_text", None) or (args[1] if len(args) > 1 else None)
+                resume_preview = kwargs.get("resume_text", None) or (args[0] if len(args) > 0 else None)
+            except Exception:
+                pass
+            print("\n" + "#" * 80)
+            print("PIPELINE TRACE — extract_keywords_llm called")
+            print(" Provider selected:", provider)
+            print(" JD preview:", _short_repr(jd_preview, maxlen=300))
+            print(" Resume preview:", _short_repr(resume_preview, maxlen=200))
+            print("#" * 80 + "\n")
+            start = time.time()
+            out = _orig_extract_keywords_llm(*args, **kwargs)
+            dur = time.time() - start
+            # print summary
+            try:
+                matched = out.get("keywords", [])
+                missing = out.get("missing", [])
+                print("\n" + "-" * 60)
+                print(f"extract_keywords_llm SUMMARY: matched={len(matched)}, missing={len(missing)}, elapsed={dur:.2f}s")
+                if len(matched) > 0:
+                    print(" First matched items:")
+                    for m in matched[:10]:
+                        print("  -", _short_repr(m.get("term") or m.get("keyword") or m))
+                if len(missing) > 0:
+                    print(" First missing items:")
+                    for m in missing[:10]:
+                        print("  -", _short_repr(m.get("term") or m))
+                print("-" * 60 + "\n")
+            except Exception:
+                pass
+            return out
+        extract_keywords_llm = _extract_wrapper
+
+except Exception as e:
+    # If wrapping fails, log to logger but do not raise so pipeline still works.
+    try:
+        logger.exception("Failed to install pipeline tracers: %s", e)
+    except Exception:
+        print("Failed to install pipeline tracers:", e)
+#--------------------

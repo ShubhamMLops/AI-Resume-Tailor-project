@@ -13,3 +13,12 @@ weasyprint>=62.0
 jinja2>=3.1.4
 
 reportlab>=4.2.2
+
+scikit-learn>=1.2.2
+spacy>=3.5.0
+yake>=0.4.8
+rapidfuzz>=2.1.0
+pdfplumber>=0.7.6
+pytest>=7.0.1
+python-multipart>=0.0.5
+sentence-transformers>=2.2.2

@@ -19,6 +19,87 @@ from pipeline import (
     extract_gaps,
 )
 
+from typing import List
+# other imports...
+
+import traceback
+import streamlit as st
+
+def _show_pipeline_error(e: Exception, provider_list=None, current_provider=None):
+    """
+    Show friendly error messages in Streamlit UI for pipeline/provider failures,
+    and allow the user to update API keys for providers and retry.
+
+    - provider_list: optional list of provider names to show in the UI (e.g. ["gemini", "openai", "anthropic"])
+      If None, a minimal set is shown.
+    - current_provider: optional provider name that was selected when the error occurred.
+    """
+    msg = str(e) or "An unknown error occurred."
+    msg_low = msg.lower()
+
+    st.error("⚠️ LLM Provider Error")
+
+    if "quota" in msg_low or "429" in msg_low or "rate limit" in msg_low or "resourceexhausted" in msg_low:
+        st.markdown(
+            "**The selected LLM provider rejected the request due to quota or rate limits.**\n\n"
+            "- Check the API key you entered in the UI and ensure it is valid for the selected provider.\n"
+            "- If you're using Google Gemini, check project quotas & billing in Google Cloud Console.\n"
+            "- Try selecting a different provider in the UI or provide a different API key below and press *Save & Retry*."
+        )
+    elif "api key" in msg_low or "invalid" in msg_low or "not configured" in msg_low:
+        st.markdown(
+            "**Provider API key is missing or invalid.**\n\n"
+            "- Re-enter the provider API key in the UI and try again."
+        )
+    elif "network" in msg_low or "timeout" in msg_low:
+        st.markdown(
+            "**Network / timeout error contacting the provider.**\n\n"
+            "- Check your internet connection and try again."
+        )
+    else:
+        st.markdown(
+            "The language model request failed. Try:\n\n"
+            "- Checking provider selection and API key in the UI.\n"
+            "- Trying a different provider if available.\n"
+            "- Waiting a moment and retrying (rate limits can be transient)."
+        )
+
+    # Provider quick-fix UI ------------------------------------------------
+    st.markdown("**Quick fix — try a different API key or provider:**")
+
+    # default providers if none passed
+    if not provider_list:
+        provider_list = ["gemini", "openai", "anthropic"]
+
+    # ensure session storage for provider keys exists
+    if "provider_keys" not in st.session_state:
+        # keep existing keys if your app stored them under a different name, adapt as needed
+        st.session_state["provider_keys"] = {}
+
+    cols = st.columns([2, 4, 2])
+    with cols[0]:
+        sel = st.selectbox("Provider", options=provider_list, index=(provider_list.index(current_provider) if current_provider in provider_list else 0))
+    with cols[1]:
+        # retrieve present key if available
+        existing = st.session_state["provider_keys"].get(sel, "")
+        new_key = st.text_input(f"API key for {sel}", value=existing, placeholder="paste API key here")
+    with cols[2]:
+        if st.button("Save & Retry"):
+            # store the new key in session and rerun app to retry the pipeline
+            st.session_state["provider_keys"][sel] = new_key.strip()
+            st.success(f"Saved key for {sel}. Retrying...")
+            st.experimental_rerun()
+
+    st.markdown("---")
+    # Developer details (hidden by default)
+    with st.expander("Show provider error / details"):
+        st.write("**Provider error message:**")
+        st.code(msg, language="text")
+        st.write("**Full traceback (developer):**")
+        st.code(traceback.format_exc(), language="text")
+
+
+
 # -------------------------
 # Stable editor/download state
 # -------------------------
@@ -254,26 +335,30 @@ if resume_text.strip() and jd_text.strip():
     # -----------------
     st.subheader("LLM Keyword Optimizer")
     if st.button("Extract ranked keywords with AI", key="btn_kw_extract"):
-        try:
-            # Run extraction (always uses current jd_text variable)
-            kw = extract_keywords_llm(
-                resume_text, jd_text,
-                provider_pref=provider, model_name=(model or None),
-                temperature=temperature, max_tokens=min(max_tokens, 1200), keys=keys
-            )
+        with st.spinner("Extracting keywords from JD — this may call your selected LLM provider..."):
+            try:
+                # Run extraction (always uses current jd_text variable)
+                kw = extract_keywords_llm(
+                    resume_text, jd_text,
+                    provider_pref=provider, model_name=(model or None),
+                    temperature=temperature, max_tokens=min(max_tokens, 1200), keys=keys
+                )
 
-            # Overwrite session state with fresh results
-            st.session_state["kw_llm"] = kw
+                # Overwrite session state with fresh results
+                st.session_state["kw_llm"] = kw
 
-            # Record the JD used so future changes will clear the cache
-            st.session_state["_prev_jd_for_kw"] = jd_text or ""
+                # Record the JD used so future changes will clear the cache
+                st.session_state["_prev_jd_for_kw"] = jd_text or ""
 
-            # Clear downstream cached ATS results so they will be recomputed
-            st.session_state.pop("final_ats_llm", None)
+                # Clear downstream cached ATS results so they will be recomputed
+                st.session_state.pop("final_ats_llm", None)
 
-            st.success("Keywords extracted from the current JD.")
-        except Exception as e:
-            st.error(str(e))
+                st.success("Keywords extracted from the current JD.")
+            except Exception as e:
+                # Show friendly error in the UI (and developer details in an expander)
+                _show_pipeline_error(e)
+                st.stop()
+
 
 
     kw_obj = st.session_state.get("kw_llm")
@@ -294,10 +379,12 @@ if resume_text.strip() and jd_text.strip():
                     if not term:
                         continue
                     cat = item.get("category", "general")
-                    variants = item.get("variants", [])
                     rank = item.get("rank", "?")
-                    suffix = f" · variants: {', '.join(variants)}" if variants else ""
-                    st.write(f"{rank}. **{term}** · _{cat}_{suffix}")
+                    expl = item.get("explanation", "") or item.get("explanation", "")
+                    st.write(f"{rank}. **{term}** · _{cat}_")
+                    if expl:
+                        st.caption(expl)
+
             else:
                 st.error("⚠️ No parsed keywords available from LLM.")
                 st.text("=== RAW JSON FROM LLM ===\n" + str(kw_obj.get("_raw_json", "")))
@@ -352,6 +439,53 @@ if resume_text.strip() and jd_text.strip():
             st.session_state["kw_sentences_edit"] = ""
             st.session_state["kw_sentences_saved_text"] = ""
             st.info("Technical skills cleared.")
+    # Ensure kw_sentences_edit in session_state is a string before passing to text_area
+    import json
+
+    def _ensure_str_for_textarea(key: str):
+        """Ensure st.session_state[key] is a string; convert lists/dicts/None safely."""
+        if key not in st.session_state:
+            st.session_state.setdefault(key, "")
+            return
+
+        v = st.session_state.get(key)
+        # If already string, leave it
+        if isinstance(v, str):
+            return
+
+        # If a list/tuple -> join with newlines (preserves per-line skill lists)
+        if isinstance(v, (list, tuple)):
+            try:
+                st.session_state[key] = "\n".join(map(str, v))
+                return
+            except Exception:
+                pass
+
+        # If dict -> pretty JSON
+        if isinstance(v, dict):
+            try:
+                st.session_state[key] = json.dumps(v, ensure_ascii=False, indent=2)
+                return
+            except Exception:
+                pass
+
+        # If None -> empty string
+        if v is None:
+            st.session_state[key] = ""
+            return
+
+        # Fallback: coerce to string (safe)
+        try:
+            st.session_state[key] = str(v)
+        except Exception:
+            # ultimate fallback
+            st.session_state[key] = ""
+
+    # Call the helper for the specific widget key
+    _ensure_str_for_textarea("kw_sentences_edit")
+
+    # Optional debug: display current type in the app for immediate diagnosis (remove later)
+    st.markdown(f"**DEBUG:** kw_sentences_edit type = `{type(st.session_state.get('kw_sentences_edit')).__name__}`")
 
     kw_edit = st.text_area("Technical Skills (editable, plain text; will be inserted after Profile Summary)", key="kw_sentences_edit", height=220)
 
